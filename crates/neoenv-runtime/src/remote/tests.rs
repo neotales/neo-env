@@ -88,6 +88,27 @@ fn git_failure_retains_status_but_never_renders_stderr() {
 }
 
 #[test]
+fn local_git_subpaths_reject_query_fragment_and_backslash() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().canonicalize().unwrap();
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    for subpath in ["task?query", "task#fragment", r"dir\task"] {
+        let source = format!("{}@{commit}//{subpath}", path.display());
+        assert!(RemoteModule::parse(&source).is_err(), "{source}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_local_git_trailing_space_never_aliases_a_trusted_path() {
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    for path in [r"\\?\C:\work\repo ", r"C:\work\repo "] {
+        assert!(RemoteModule::parse(&format!("{path}@{commit}//task.yaml")).is_err());
+        assert!(super::model::canonical_repository(&format!("file://{path}")).is_err());
+    }
+}
+
+#[test]
 fn canonicalizes_github_and_scopes_cache_by_immutable_reference() {
     let commit = "0123456789abcdef0123456789abcdef01234567";
     let first = RemoteModule::parse(&format!("github:Octo/Example.git@{commit}//tasks")).unwrap();

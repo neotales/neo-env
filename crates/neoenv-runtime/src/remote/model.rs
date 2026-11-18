@@ -373,7 +373,12 @@ impl RemoteModule {
             .rsplit_once('@')
             .ok_or(RemoteError::MissingImmutableReference)?;
         let (reference, subpath) = match revision.split_once("//") {
-            Some((reference, subpath)) => (reference, Some(normalize_subpath(subpath)?)),
+            Some((reference, subpath)) => {
+                if subpath.contains(['?', '#', '\\']) {
+                    return Err(RemoteError::InvalidSubpath);
+                }
+                (reference, Some(normalize_subpath(subpath)?))
+            }
             None => (revision, None),
         };
         let repository = local_repository_identity(path)?;
@@ -451,7 +456,9 @@ pub fn is_local_git(value: &str) -> bool {
 /// collapsed, and `..` is refused rather than folded. No filesystem access
 /// happens here, so parsing a reference cannot follow a link.
 fn local_repository_identity(value: &str) -> Result<String, RemoteError> {
-    crate::local_repository::normalize(value.trim()).ok_or(RemoteError::InvalidSource)
+    #[cfg(not(windows))]
+    let value = value.trim();
+    crate::local_repository::normalize(value).ok_or(RemoteError::InvalidSource)
 }
 
 #[must_use]
