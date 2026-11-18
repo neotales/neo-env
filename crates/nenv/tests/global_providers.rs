@@ -1664,6 +1664,7 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
                     Err(error) => panic!("Aqua input fixture listener failed: {error}"),
                 }
             }
+            served
         });
         let mut server = FixtureServer::new(stop, server_thread);
         let mut command = global_command(directory.path(), &config_home, &data_home);
@@ -1683,7 +1684,11 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
             command.env("NEOENV_GLOBAL_AQUA_MANIFEST_SHA256", digest);
         }
         let output = command.output().unwrap();
-        server.stop();
+        let served = server.stop();
+        assert_eq!(
+            served, expected_requests,
+            "Aqua fixture served fewer requests than expected (expected success: {expected})"
+        );
         assert_eq!(
             output.status.success(),
             expected,
@@ -1708,28 +1713,30 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
 }
 
 /// Stops and joins a local fixture server on both normal return and unwind.
-struct FixtureServer {
+struct FixtureServer<T> {
     stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
+    thread: Option<thread::JoinHandle<T>>,
 }
 
-impl FixtureServer {
-    fn new(stop: Arc<AtomicBool>, thread: thread::JoinHandle<()>) -> Self {
+impl<T> FixtureServer<T> {
+    fn new(stop: Arc<AtomicBool>, thread: thread::JoinHandle<T>) -> Self {
         Self {
             stop,
             thread: Some(thread),
         }
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> T {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("fixture server thread");
-        }
+        self.thread
+            .take()
+            .expect("fixture server thread")
+            .join()
+            .expect("fixture server thread")
     }
 }
 
-impl Drop for FixtureServer {
+impl<T> Drop for FixtureServer<T> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
