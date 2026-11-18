@@ -1049,7 +1049,24 @@ fn installed_cargo_tool_is_selected_by_project_which_use_and_exec() {
         .join(neoenv_installer::tools::install_key(&shared_tool).unwrap());
     assert!(shared_root.exists());
     let mut obsolete_tool = current_tool.clone();
-    let obsolete_toolchain = format!("{}-obsolete-fixture", current_build.toolchain);
+    let (current_version, target) = current_build
+        .toolchain
+        .split_once('-')
+        .expect("current Cargo toolchain has a target triple");
+    let obsolete_version = if current_version == "0.0.0" {
+        "0.0.1"
+    } else {
+        "0.0.0"
+    };
+    let obsolete_toolchain = format!("{obsolete_version}-{target}");
+    assert!(
+        neoenv_core::tools::is_cargo_toolchain_pin(&obsolete_toolchain),
+        "obsolete Cargo fixture must use a supported exact toolchain pin"
+    );
+    assert_ne!(
+        obsolete_toolchain, current_build.toolchain,
+        "obsolete Cargo fixture must use a different version for the same target"
+    );
     obsolete_tool.cargo_toolchain = Some(obsolete_toolchain.clone());
     let mut obsolete_build = current_build;
     obsolete_build.toolchain = obsolete_toolchain;
