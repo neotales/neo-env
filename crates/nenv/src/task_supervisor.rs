@@ -683,3 +683,59 @@ impl Drop for OwnedChild {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waitable_child_and_group_cleanup_work_on_host() {
+        const CHILD_FLAG: &str = "NEOENV_SUPERVISOR_WAITID_PROBE";
+        if std::env::var_os(CHILD_FLAG).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "task_supervisor::tests::waitable_child_and_group_cleanup_work_on_host",
+                    "--nocapture",
+                ])
+                .env(CHILD_FLAG, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated waitid probe: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        signal_hook::flag::register(signal_hook::consts::SIGCHLD, flag).unwrap();
+        let process = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut owned = OwnedChild(Some(process));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let observed = waitid(
+                WaitId::Pid(ChildPid::from_child(owned.0.as_ref().unwrap())),
+                WaitIdOptions::EXITED
+                    | WaitIdOptions::STOPPED
+                    | WaitIdOptions::NOHANG
+                    | WaitIdOptions::NOWAIT,
+            )
+            .expect("waitid probe");
+            if let Some(status) = observed
+                && (status.exited() || status.killed() || status.dumped())
+            {
+                let status = owned.stop().expect("owned group cleanup probe");
+                assert_eq!(status.into_raw(), 1792);
+                break;
+            }
+            assert!(Instant::now() < deadline, "waitid probe deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}

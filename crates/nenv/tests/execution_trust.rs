@@ -1010,12 +1010,31 @@ struct LocalGitFixture {
 // On fixture failure, probe Git with the production protocol restrictions.
 // Report only fixed classifications; never print Git's path-bearing stderr.
 fn diagnose_local_git(local: &LocalGitFixture) -> String {
-    let target = TempDir::new().unwrap();
     let origin = neoenv_runtime::remote::RemoteModule::parse(&local.spec).unwrap();
     let path = origin.local_path().unwrap();
     #[cfg(windows)]
     let path = path.replace('/', "\\");
     let mut reports = Vec::new();
+    // Mirror the production depth and staging layout: Git for Windows may
+    // reject a deep worktree even when a shallow temporary repository works.
+    let parent = local
+        .cached
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    fs::create_dir_all(parent).unwrap();
+    let staged = tempfile::Builder::new()
+        .prefix("neoenv-module-")
+        .tempdir_in(parent)
+        .unwrap();
+    let target = staged.path().join("source");
     let options = [
         "-c",
         "protocol.allow=never",
@@ -1040,15 +1059,27 @@ fn diagnose_local_git(local: &LocalGitFixture) -> String {
         .split("//")
         .next()
         .unwrap();
-    for args in [
-        vec!["init"],
-        vec!["fetch", "--depth=1", "--no-tags", path.as_ref(), reference],
-    ] {
-        let output = Command::new("git")
-            .args(options)
-            .arg("-C")
-            .arg(target.path())
-            .args(&args)
+    for stage in ["init", "fetch", "rev-parse", "checkout"] {
+        let mut command = Command::new("git");
+        command.args(options);
+        if stage == "init" {
+            command.arg("init").arg(&target);
+        } else {
+            command.arg("-C").arg(&target);
+            match stage {
+                "fetch" => {
+                    command.args(["fetch", "--depth=1", "--no-tags", path.as_ref(), reference]);
+                }
+                "rev-parse" => {
+                    command.args(["rev-parse", "FETCH_HEAD^{commit}"]);
+                }
+                "checkout" => {
+                    command.args(["checkout", "--detach", "--force", reference]);
+                }
+                _ => unreachable!(),
+            }
+        }
+        let output = command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1074,13 +1105,16 @@ fn diagnose_local_git(local: &LocalGitFixture) -> String {
                 "does not appear to be a git repository",
             ),
             ("revision", "couldn't find remote ref"),
+            ("long_path", "filename too long"),
+            ("create_file", "unable to create file"),
+            ("invalid_path", "invalid path"),
         ]
         .iter()
         .filter_map(|(label, needle)| stderr.contains(needle).then_some(*label))
         .collect::<Vec<_>>();
         reports.push(format!(
-            "{} status={} classes={labels:?}",
-            args[0], output.status
+            "{stage} status={} classes={labels:?}",
+            output.status
         ));
     }
     reports.join("; ")
