@@ -8,7 +8,7 @@
 
 * text=auto
 
-*.rs   text
+*.rs   text eol=lf
 *.toml text
 *.json text
 *.md   text
