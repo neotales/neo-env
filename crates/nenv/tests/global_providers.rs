@@ -196,7 +196,6 @@ fn system_scope_mutation_fails_closed_without_writing() {
     assert!(!system_config.exists() && !system_install.exists());
 }
 
-#[cfg(unix)]
 fn provider_lock(
     id: &str,
     version: &str,
@@ -1067,20 +1066,22 @@ fn invalid_config_file_types_are_errors_not_absence() {
         .unwrap()
     };
 
-    std::os::unix::fs::symlink(
-        directory.path().join("missing-system.toml"),
-        system_config.join("neoenv.toml"),
-    )
-    .unwrap();
-    let output = run("--global");
-    assert!(!output.status.success(), "{output:?}");
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("not a regular file")
-    );
-
-    fs::remove_file(system_config.join("neoenv.toml")).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            directory.path().join("missing-system.toml"),
+            system_config.join("neoenv.toml"),
+        )
+        .unwrap();
+        let output = run("--global");
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("not a regular file")
+        );
+        fs::remove_file(system_config.join("neoenv.toml")).unwrap();
+    }
     fs::create_dir(system_config.join("neoenv.toml")).unwrap();
     let output = run("--global");
     assert!(!output.status.success(), "{output:?}");
@@ -1090,27 +1091,30 @@ fn invalid_config_file_types_are_errors_not_absence() {
             .contains("not a regular file")
     );
 
-    std::os::unix::fs::symlink(
-        directory.path().join("missing-user.toml"),
-        user_config.join("neoenv/neoenv.toml"),
-    )
-    .unwrap();
-    let output = global_command(
-        directory.path(),
-        &user_config,
-        &directory.path().join("user-data"),
-    )
-    .env("NEOENV_GLOBAL_CONFIG_DIR", &system_config)
-    .env("NEOENV_GLOBAL_INSTALL_DIR", &system_install)
-    .args(["tool", "which", "--user", "go"])
-    .output()
-    .unwrap();
-    assert!(!output.status.success(), "{output:?}");
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("not a regular file")
-    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            directory.path().join("missing-user.toml"),
+            user_config.join("neoenv/neoenv.toml"),
+        )
+        .unwrap();
+        let output = global_command(
+            directory.path(),
+            &user_config,
+            &directory.path().join("user-data"),
+        )
+        .env("NEOENV_GLOBAL_CONFIG_DIR", &system_config)
+        .env("NEOENV_GLOBAL_INSTALL_DIR", &system_install)
+        .args(["tool", "which", "--user", "go"])
+        .output()
+        .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("not a regular file")
+        );
+    }
 }
 
 #[test]

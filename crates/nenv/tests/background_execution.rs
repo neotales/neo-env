@@ -99,6 +99,7 @@ fn success(output: &Output) -> String {
 // slow for large debug binaries on a busy host. Timeout behavior itself is
 // covered by the dedicated deadline tests below.
 #[test]
+#[cfg(target_os = "linux")]
 fn job_steps_overlap_until_an_id_wait_and_keep_default_step_order() {
     let root = project(
         r#"
@@ -133,6 +134,7 @@ jobs:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn background_jobs_overlap_as_whole_sequences_and_publish_only_on_join() {
     let root = project(
         r#"
@@ -173,6 +175,7 @@ jobs:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn independent_job_dependencies_overlap_by_default_and_join_before_the_dependent_job() {
     let root = project(
         r"
@@ -205,6 +208,7 @@ jobs:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn independent_job_branches_launch_before_joining_nested_dependencies() {
     let root = project(&format!(
         r"
@@ -309,6 +313,7 @@ fn bounded_output_terminates_and_reaps_a_timed_out_child() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn independent_job_handoffs_merge_in_plan_order_even_when_completed_out_of_order() {
     let root = project(
         r#"
@@ -337,6 +342,7 @@ fn job_background_is_rejected_instead_of_ignored() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn background_exec_pipeline_preserves_pipe_and_chain_semantics() {
     let root = project(
         r"
@@ -355,6 +361,7 @@ tasks:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn background_pipeline_kills_exited_stage_descendants_before_pipe_eof() {
     let root = project(
         r"
@@ -373,6 +380,7 @@ tasks:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn default_exec_matches_portable_parser_and_keeps_args_literal() {
     let root = project(
         r"
@@ -400,6 +408,7 @@ tasks:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn passthrough_reaches_every_executed_pipeline_in_a_chain() {
     let root = project(
         r"
@@ -423,6 +432,7 @@ tasks:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn foreground_success_preserves_detached_descendants_and_pipe_eof() {
     let root = project(
         r#"
@@ -442,6 +452,7 @@ tasks:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn foreground_timeout_stops_descendant_holding_pipeline_open() {
     let root = project(
         r#"
@@ -458,8 +469,8 @@ jobs:
     assert!(!root.path().join("escaped").exists());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
+#[cfg(target_os = "linux")]
 fn host_timeout_resumes_stopped_supervisor_and_cleans_task() {
     let root = project(
         r"
@@ -497,6 +508,7 @@ tasks:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn job_execution_repairs_inherited_ignored_sigchld() {
     let root = project("jobs: {build: {steps: [{uses: shell, run: 'echo job-ok'}]}}");
     approve(root.path());
@@ -520,6 +532,7 @@ fn job_execution_repairs_inherited_ignored_sigchld() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn exec_template_if_else_matches_portable_and_argv_keeps_template_literal() {
     let root = project(
         r"
@@ -561,7 +574,22 @@ tasks:
     );
 }
 
+#[cfg(not(target_os = "linux"))]
 #[test]
+fn execution_reports_platform_unavailability_without_running_the_task() {
+    let root = project("tasks: {unsupported: {run: 'touch should-not-run'}}");
+    let output = run(&root, &["run", "unsupported"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("exclusive child ownership is not implemented on this platform"),
+        "{output:?}"
+    );
+    assert!(!root.path().join("should-not-run").exists());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn jobs_have_an_overall_deadline_and_do_not_run_later_steps_after_it() {
     let root = project(
         r"

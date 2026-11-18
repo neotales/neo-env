@@ -51,6 +51,27 @@ struct Binaries {
     _target: TempDir,
 }
 
+/// Normalizes a temporary fixture file before applying LF-based test surgery.
+fn replace_fixture_marker(contents: &str, marker: &str, replacement: &str) -> String {
+    let contents = contents.replace("\r\n", "\n");
+    assert_eq!(contents.matches(marker).count(), 1);
+    contents.replacen(marker, replacement, 1)
+}
+
+/// Adds the fixture-only TLS dependency to the temporary lockfile copy.
+fn add_fixture_lock_dependency(contents: &str) -> String {
+    let lock = contents.replace("\r\n", "\n");
+    let start = lock.find("name = \"neoenv-runtime\"\n").unwrap();
+    let end = lock[start..]
+        .find("\n[[package]]")
+        .map_or(lock.len(), |offset| start + offset);
+    let package = &lock[start..end];
+    assert!(!package.contains("\n \"rustls\","));
+    assert_eq!(package.matches("\n \"rustix\",").count(), 1);
+    let package = package.replacen("\n \"rustix\",", "\n \"rustix\",\n \"rustls\",", 1);
+    format!("{}{}{}", &lock[..start], package, &lock[end..])
+}
+
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {
@@ -89,26 +110,20 @@ fn binaries() -> Binaries {
         .join("crates/neoenv-runtime/Cargo.toml");
     let contents = fs::read_to_string(&manifest).unwrap();
     let marker = "[dependencies]\n";
-    assert_eq!(contents.matches(marker).count(), 1);
-    fs::write(&manifest, contents.replacen(marker,
-            "[dependencies]\nrustls = { version = \"=0.23.46\", default-features = false, features = [\"ring\", \"std\", \"tls12\"] }\n", 1)).unwrap();
+    fs::write(
+        &manifest,
+        replace_fixture_marker(
+            &contents,
+            marker,
+            "[dependencies]\nrustls = { version = \"=0.23.46\", default-features = false, features = [\"ring\", \"std\", \"tls12\"] }\n",
+        ),
+    )
+    .unwrap();
     // Modify only the temporary copy's lockfile to reflect the fixture-only
     // dependency; the real workspace lockfile is never written by tests.
     let lock_path = fixture_source.path().join("Cargo.lock");
     let lock = fs::read_to_string(&lock_path).unwrap();
-    let start = lock.find("name = \"neoenv-runtime\"\n").unwrap();
-    let end = lock[start..]
-        .find("\n[[package]]")
-        .map_or(lock.len(), |offset| start + offset);
-    let package = &lock[start..end];
-    assert!(!package.contains("\n \"rustls\","));
-    assert_eq!(package.matches("\n \"rustix\",").count(), 1);
-    let package = package.replacen("\n \"rustix\",", "\n \"rustix\",\n \"rustls\",", 1);
-    fs::write(
-        &lock_path,
-        format!("{}{}{}", &lock[..start], package, &lock[end..]),
-    )
-    .unwrap();
+    fs::write(&lock_path, add_fixture_lock_dependency(&lock)).unwrap();
     let transport = fixture_source
         .path()
         .join("crates/neoenv-runtime/src/transport.rs");
@@ -577,6 +592,30 @@ fn concurrent_https_fetches_publish_one_verified_cache_entry(binaries: &Binaries
         .join("files")
         .join(digest);
     assert_eq!(fs::read(path).unwrap(), body);
+}
+
+#[test]
+fn fixture_marker_replacement_handles_lf_and_crlf_inputs() {
+    let marker = "[dependencies]\n";
+    let replacement = "[dependencies]\nrustls = { version = \"=0.23.46\" }\n";
+    for (input, expected) in [
+        (
+            "[dependencies]\nserde = \"1\"\n",
+            "[dependencies]\nrustls = { version = \"=0.23.46\" }\nserde = \"1\"\n",
+        ),
+        (
+            "[dependencies]\r\nserde = \"1\"\r\n",
+            "[dependencies]\nrustls = { version = \"=0.23.46\" }\nserde = \"1\"\n",
+        ),
+    ] {
+        assert_eq!(replace_fixture_marker(input, marker, replacement), expected);
+    }
+
+    let lock = "name = \"neoenv-runtime\"\nversion = \"0.1.0\"\ndependencies = [\n \"rustix\",\n]\n\n[[package]]\n";
+    for input in [lock.to_owned(), lock.replace('\n', "\r\n")] {
+        let changed = add_fixture_lock_dependency(&input);
+        assert!(changed.contains("\n \"rustix\",\n \"rustls\",\n"));
+    }
 }
 
 #[test]
