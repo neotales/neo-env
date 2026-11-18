@@ -289,6 +289,11 @@ impl HttpsFixture {
                 for listener in &listeners {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // Some platforms inherit the listener's nonblocking mode.
+                            // rustls StreamOwned expects blocking I/O with bounded timeouts.
+                            stream
+                                .set_nonblocking(false)
+                                .expect("set accepted HTTPS socket blocking");
                             server_accepts.fetch_add(1, Ordering::Relaxed);
                             server_accepted_addresses
                                 .lock()
@@ -299,8 +304,8 @@ impl HttpsFixture {
                             let requests = Arc::clone(&server_requests);
                             let errors = Arc::clone(&server_errors);
                             clients.push(thread::spawn(move || {
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                            stream.set_read_timeout(Some(Duration::from_secs(5))).expect("set HTTPS read timeout");
+                            stream.set_write_timeout(Some(Duration::from_secs(5))).expect("set HTTPS write timeout");
                             let connection = rustls::ServerConnection::new(tls).unwrap();
                             let mut tls = rustls::StreamOwned::new(connection, stream);
                             let mut request = [0_u8; 4096];
@@ -551,6 +556,45 @@ fn https_fetch_then_approval_and_execution_for_module_and_package(binaries: &Bin
     }
 }
 
+fn delayed_client_handshake_succeeds(binaries: &Binaries) {
+    let server = HttpsFixture::new(Response::Body(b"ok".to_vec()), binaries);
+    let stream = std::net::TcpStream::connect(server.ipv4_address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while server.accepts.load(Ordering::Relaxed) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not accept delayed client"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::sleep(Duration::from_millis(100));
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            fs::read(server.dir.path().join("ca.der")).unwrap(),
+        ))
+        .unwrap();
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap();
+    let connection = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let mut tls = rustls::StreamOwned::new(connection, stream);
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    tls.flush().unwrap();
+    let mut response =
+        vec![0; b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".len()];
+    tls.read_exact(&mut response).unwrap();
+    assert!(response.ends_with(b"ok"));
+}
+
 fn https_fetch_rejects_mismatch_oversize_stall_and_redirect_before_publish(binaries: &Binaries) {
     for response in [
         Response::Body(b"different bytes".to_vec()),
@@ -795,6 +839,7 @@ fn controlled_direct_file_https_lifecycle() {
     let binaries = binaries();
     let endpoint_fixture = HttpsFixture::new(Response::Body(Vec::new()), &binaries);
     endpoint_fixture.assert_loopback_endpoint_families();
+    delayed_client_handshake_succeeds(&binaries);
     https_fetch_then_approval_and_execution_for_module_and_package(&binaries);
     https_fetch_rejects_mismatch_oversize_stall_and_redirect_before_publish(&binaries);
     https_fetch_rejects_untrusted_server_certificate(&binaries);
