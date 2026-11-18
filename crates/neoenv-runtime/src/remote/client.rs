@@ -280,9 +280,14 @@ pub fn fetch_module_with_cancellation(
         // other scheme, and it happens before a Git child is spawned.
         return Err(RemoteError::NonLocalFetch(module.canonical()));
     };
-    let transport = LocalGitTransport {
-        url: path.to_owned(),
-    };
+    if !crate::local_repository::validate_identity(&module.repository) {
+        return Err(RemoteError::InvalidSource);
+    }
+    #[cfg(windows)]
+    let path = path.replace('/', "\\");
+    #[cfg(not(windows))]
+    let path = path.to_owned();
+    let transport = LocalGitTransport { url: path };
     fetch_module_with_transport(project_root, module, update, cancellation, &transport)
 }
 

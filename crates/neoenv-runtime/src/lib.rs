@@ -4,6 +4,7 @@ pub mod budget;
 pub mod discovery;
 pub mod inventory;
 mod inventory_files;
+mod local_repository;
 pub mod modules;
 pub mod paths;
 pub mod policy;

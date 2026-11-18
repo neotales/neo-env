@@ -98,6 +98,61 @@ fn canonicalizes_github_and_scopes_cache_by_immutable_reference() {
     assert_ne!(first.canonical(), second.canonical());
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_local_git_identity_round_trips_through_both_trust_stores() {
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let other_commit = "1123456789abcdef0123456789abcdef01234567";
+    let source = |path: &str, revision: &str| {
+        RemoteModule::parse(&format!("{path}@{revision}//task.yaml")).unwrap()
+    };
+    let ordinary = source(r"C:\work\repo", commit);
+    let verbatim = source(r"\\?\C:\work\repo", commit);
+    assert_eq!(ordinary.repository, "file://C:/work/repo");
+    assert_eq!(ordinary.repository, verbatim.repository);
+    assert_eq!(ordinary.cache_key(), verbatim.cache_key());
+    assert_ne!(
+        ordinary.cache_key(),
+        source(r"C:\work\other", commit).cache_key()
+    );
+    assert_ne!(
+        ordinary.cache_key(),
+        source(r"C:\work\repo", other_commit).cache_key()
+    );
+
+    let policy = format!(
+        "[remote]\nallow = [{}]\n",
+        toml::Value::String(ordinary.repository.clone())
+    );
+    let allowed = parse_trusted_repositories(&policy, Path::new("policy.toml")).unwrap();
+    assert_eq!(allowed, vec![ordinary.repository.clone()]);
+
+    let root = TempDir::new().unwrap();
+    let store = root.path().join("projects.toml");
+    crate::trust::approve_remote_in(&store, &ordinary.repository, commit, "task.yaml", b"safe")
+        .unwrap();
+    assert!(
+        crate::trust::remote_status_in(&store, &verbatim.repository, commit, "task.yaml")
+            .unwrap()
+            .1
+    );
+    assert!(
+        !crate::trust::remote_status_in(&store, &ordinary.repository, other_commit, "task.yaml")
+            .unwrap()
+            .1
+    );
+    assert!(
+        !crate::trust::remote_status_in(
+            &store,
+            &source(r"C:\work\other", commit).repository,
+            commit,
+            "task.yaml"
+        )
+        .unwrap()
+        .1
+    );
+}
+
 #[test]
 fn transport_seam_keeps_github_default_and_can_use_one_local_origin() {
     let directory = TempDir::new().unwrap();

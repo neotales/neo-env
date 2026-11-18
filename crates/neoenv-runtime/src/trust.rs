@@ -1295,22 +1295,11 @@ fn validate_remote_fields(
 /// backslash. No filesystem access happens here, so validating an identity
 /// cannot follow a link.
 fn validate_local_repository_path(value: &str) -> Result<(), String> {
-    if value.is_empty() || value.contains(['?', '#', '\\']) {
-        return Err("local repository must be an absolute path with no query or fragment".into());
+    if crate::local_repository::validate_identity(&format!("file://{value}")) {
+        Ok(())
+    } else {
+        Err("local repository must have a canonical absolute path".into())
     }
-    let path = Path::new(value);
-    if !path.is_absolute() {
-        return Err("local repository must be an absolute path".into());
-    }
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
-            Component::CurDir | Component::ParentDir => {
-                return Err("local repository path must not contain `.` or `..` segments".into());
-            }
-        }
-    }
-    Ok(())
 }
 
 /// A Git repository identity is `github.com/<owner>/<name>`, lowercase.

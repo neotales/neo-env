@@ -269,7 +269,17 @@ fn a_task_package_in_a_nested_subfolder_runs_when_its_path_is_trusted() {
     let refused = fixture.run(&["task", "run", "check"]);
     Fixture::assert_trust_refusal(&refused);
     let message = stderr(&refused);
-    assert!(message.contains("tasks/lint/task.yaml"), "{message}");
+    assert!(
+        message.contains(
+            &fixture
+                .path("tasks/lint/task.yaml")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "{message}"
+    );
     assert!(!fixture.path("nested-package-ran").exists());
 
     let package = fixture.path("tasks/lint/task.yaml").canonicalize().unwrap();
@@ -981,6 +991,14 @@ fn a_changed_remote_cache_file_fails_closed() {
 const LOCAL_GIT_PACKAGE: &str =
     "tasks:\n  lint:\n    uses: shell\n    run: 'touch local-git-package-ran'\n";
 
+#[test]
+fn yaml_string_encoding_preserves_windows_git_paths() {
+    let spec = r"\\?\C:\Users\runner\origin@commit//tasks/lint/task.yaml";
+    let document = format!("from: {}\n", serde_json::to_string(spec).unwrap());
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&document).unwrap();
+    assert_eq!(parsed["from"].as_str(), Some(spec));
+}
+
 struct LocalGitFixture {
     fixture: Fixture,
     origin: PathBuf,
@@ -1013,13 +1031,16 @@ fn local_git_fixture() -> LocalGitFixture {
         "{}@{commit}//tasks/lint/task.yaml",
         origin.canonicalize().unwrap().display()
     );
+    let yaml_spec = serde_json::to_string(&spec).unwrap();
     fixture.write(
         "neoenv.yaml",
         &format!(
-            "task_packages:\n  lint:\n    from: \"{spec}\"\n    task: lint\ntasks:\n  check:\n    uses: package:lint\n"
+            "task_packages:\n  lint:\n    from: {yaml_spec}\n    task: lint\ntasks:\n  check:\n    uses: package:lint\n"
         ),
     );
-    let repository = format!("file://{}", origin.canonicalize().unwrap().display());
+    let repository = neoenv_runtime::remote::RemoteModule::parse(&spec)
+        .unwrap()
+        .repository;
     let cached = fixture
         .path(".neoenv/modules/commits")
         .join(format!("{:x}", Sha256::digest(repository.as_bytes())))

@@ -20,6 +20,27 @@ use tempfile::TempDir;
 
 mod support;
 
+// System-scope validation rejects symlinked ancestors, including an OS temp alias.
+fn secure_temp_dir() -> TempDir {
+    secure_temp_dir_in(&std::env::temp_dir())
+}
+
+fn secure_temp_dir_in(parent: &Path) -> TempDir {
+    tempfile::tempdir_in(parent.canonicalize().unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn secure_temp_dir_resolves_symlinked_temp_parent() {
+    let parent = TempDir::new().unwrap();
+    let real = parent.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let alias = parent.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let fixture = secure_temp_dir_in(&alias);
+    assert_eq!(fixture.path(), fixture.path().canonicalize().unwrap());
+}
+
 /// Global tool operations read global state, not project configuration, so they
 /// take a plain `Command`. Several of them assert that the config home was not
 /// created; an approval write would be exactly that write.
@@ -44,7 +65,7 @@ fn assert_empty(path: &Path) {
 
 #[test]
 fn scope_flags_select_user_and_system_roots() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -95,7 +116,7 @@ fn scope_flags_select_user_and_system_roots() {
 #[cfg(unix)]
 #[test]
 fn system_scope_rejects_traversal_symlink_ancestors_and_managed_links() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -148,7 +169,7 @@ fn system_scope_rejects_traversal_symlink_ancestors_and_managed_links() {
 #[cfg(windows)]
 #[test]
 fn windows_system_scope_requires_an_absolute_override() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let output = global_command(
         directory.path(),
         &directory.path().join("user-config"),
@@ -169,7 +190,7 @@ fn windows_system_scope_requires_an_absolute_override() {
 
 #[test]
 fn system_scope_mutation_fails_closed_without_writing() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -228,7 +249,7 @@ fn provider_config(
 #[test]
 #[allow(clippy::too_many_lines)]
 fn cargo_provider_selects_only_its_binary_and_allows_an_unrelated_provider() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -398,7 +419,7 @@ fn cargo_provider_selects_only_its_binary_and_allows_an_unrelated_provider() {
 
 #[test]
 fn unrelated_valid_provider_does_not_block_a_working_runtime() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -461,7 +482,7 @@ fn unrelated_valid_provider_does_not_block_a_working_runtime() {
 
 #[test]
 fn unrelated_inaccessible_provider_lock_fails_closed() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     fs::create_dir_all(user_config.join("neoenv")).unwrap();
@@ -484,7 +505,7 @@ fn unrelated_inaccessible_provider_lock_fails_closed() {
 }
 #[test]
 fn present_non_string_provider_fields_are_named_and_fail_closed() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -563,7 +584,7 @@ fn present_non_string_provider_fields_are_named_and_fail_closed() {
 
 #[test]
 fn stale_recorded_binaries_are_detected_before_fallback() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -626,7 +647,7 @@ fn stale_recorded_binaries_are_detected_before_fallback() {
 
 #[test]
 fn cross_provider_lock_entry_is_rejected() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -688,7 +709,7 @@ fn cross_provider_lock_entry_is_rejected() {
 
 #[test]
 fn multiple_records_claiming_the_same_binary_are_ambiguous() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     fs::create_dir_all(user_config.join("neoenv")).unwrap();
@@ -758,7 +779,7 @@ fn multiple_records_claiming_the_same_binary_are_ambiguous() {
 }
 #[test]
 fn inaccessible_record_cannot_be_bypassed_by_a_claiming_record() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     fs::create_dir_all(user_config.join("neoenv")).unwrap();
@@ -794,7 +815,7 @@ fn inaccessible_record_cannot_be_bypassed_by_a_claiming_record() {
 }
 #[test]
 fn provider_record_digest_mismatch_is_rejected() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     fs::create_dir_all(user_config.join("neoenv")).unwrap();
@@ -841,7 +862,7 @@ fn provider_record_digest_mismatch_is_rejected() {
 
 #[test]
 fn selected_provider_with_missing_executable_does_not_fall_back() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -904,7 +925,7 @@ fn selected_provider_with_missing_executable_does_not_fall_back() {
 
 #[test]
 fn missing_binaries_recover_ownership_from_a_valid_unrelated_lock() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -957,7 +978,7 @@ fn missing_binaries_recover_ownership_from_a_valid_unrelated_lock() {
 
 #[test]
 fn missing_binaries_recover_a_claiming_selected_provider() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     fs::create_dir_all(user_config.join("neoenv")).unwrap();
@@ -997,7 +1018,7 @@ fn missing_binaries_recover_a_claiming_selected_provider() {
 }
 #[test]
 fn corrupt_user_provider_state_does_not_fall_back_to_system() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -1046,7 +1067,7 @@ fn corrupt_user_provider_state_does_not_fall_back_to_system() {
 
 #[test]
 fn invalid_config_file_types_are_errors_not_absence() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let system_config = directory.path().join("system-config");
     let system_install = directory.path().join("system-install");
@@ -1119,7 +1140,7 @@ fn invalid_config_file_types_are_errors_not_absence() {
 
 #[test]
 fn tool_list_which_and_cleanup_honor_scope_without_cross_writes() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");
@@ -1191,7 +1212,7 @@ fn tool_list_which_and_cleanup_honor_scope_without_cross_writes() {
 
 #[test]
 fn invalid_user_layout_is_reported_instead_of_falling_back_to_system() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_config = directory.path().join("user-config");
     fs::write(&user_config, b"not a directory").unwrap();
     let system_install = directory.path().join("system-install");
@@ -1216,7 +1237,7 @@ fn invalid_user_layout_is_reported_instead_of_falling_back_to_system() {
 
 #[test]
 fn runtime_list_and_where_expose_the_scope_activation_uses() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let user_data = directory.path().join("user-data");
     let system_install = directory.path().join("system-install");
     let write = |root: &Path, version: &str| {
@@ -1269,7 +1290,7 @@ fn runtime_list_and_where_expose_the_scope_activation_uses() {
 
 #[test]
 fn global_dry_run_covers_native_github_and_package_keys_without_io() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     let output = global_command(directory.path(), &config_home, &data_home)
@@ -1517,7 +1538,7 @@ fn github_fixture_waits_for_complete_request_headers() {
 
 #[test]
 fn github_global_install_selects_metadata_asset_and_repeats_offline() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     let fixture = GithubFixture::start();
@@ -1611,7 +1632,7 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
         expected_paths: &[String],
         expected_error: Option<&str>,
     ) {
-        let directory = TempDir::new().unwrap();
+        let directory = secure_temp_dir();
         let config_home = directory.path().join("config");
         let data_home = directory.path().join("data");
         let artifact = b"#!/bin/sh\nexit 0\n";
@@ -1789,7 +1810,7 @@ impl<T> Drop for FixtureServer<T> {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn aqua_global_lock_reuse_requires_matching_manifest_pins() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     let artifact = b"#!/bin/sh\nexit 0\n";
@@ -1957,7 +1978,7 @@ fn aqua_global_lock_reuse_requires_matching_manifest_pins() {
 
 #[test]
 fn global_batch_never_exceeds_ten_provider_installers() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     let fixture = GithubFixture::start_with_delay(Duration::from_millis(100));
@@ -1980,7 +2001,7 @@ fn global_batch_never_exceeds_ten_provider_installers() {
 
 #[test]
 fn mixed_runtime_provider_failure_never_publishes_global_configuration() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     let output = global_command(directory.path(), &config_home, &data_home)
@@ -1996,7 +2017,7 @@ fn mixed_runtime_provider_failure_never_publishes_global_configuration() {
 #[cfg(unix)]
 #[test]
 fn ctrl_c_during_provider_batch_publishes_no_global_configuration() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     let fixture = GithubFixture::start_with_delay(Duration::from_secs(1));
@@ -2031,7 +2052,7 @@ fn ctrl_c_during_provider_batch_publishes_no_global_configuration() {
 
 #[test]
 fn global_provider_keys_reject_providers_that_require_pinned_project_declarations() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     for (key, required_detail) in [
@@ -2059,7 +2080,7 @@ fn global_provider_keys_reject_providers_that_require_pinned_project_declaration
 
 #[test]
 fn global_provider_keys_reject_unknown_and_remote_module_spellings() {
-    let directory = TempDir::new().unwrap();
+    let directory = secure_temp_dir();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
     for key in [

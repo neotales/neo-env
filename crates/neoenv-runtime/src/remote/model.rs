@@ -4,7 +4,7 @@ use super::{
     Arc, Digest, ExitStatus, HttpError, Sha256, StateFileError, TimeoutPolicyError, fmt, io,
     redact_url_secrets,
 };
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteModule {
@@ -369,9 +369,6 @@ impl RemoteModule {
     /// so it is refused rather than resolved.
     fn parse_local(value: &str) -> Result<Self, RemoteError> {
         let raw = value.strip_prefix("file://").unwrap_or(value);
-        if raw.contains(['?', '#', '\\']) {
-            return Err(RemoteError::InvalidSource);
-        }
         let (path, revision) = raw
             .rsplit_once('@')
             .ok_or(RemoteError::MissingImmutableReference)?;
@@ -454,27 +451,7 @@ pub fn is_local_git(value: &str) -> bool {
 /// collapsed, and `..` is refused rather than folded. No filesystem access
 /// happens here, so parsing a reference cannot follow a link.
 fn local_repository_identity(value: &str) -> Result<String, RemoteError> {
-    let value = value.trim();
-    if value.is_empty() || value.contains(['?', '#', '\\']) {
-        return Err(RemoteError::InvalidSource);
-    }
-    let path = Path::new(value);
-    if !path.is_absolute() {
-        return Err(RemoteError::InvalidSource);
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
-            Component::CurDir | Component::ParentDir => {
-                return Err(RemoteError::InvalidSource);
-            }
-        }
-    }
-    let text = normalized.to_str().ok_or(RemoteError::InvalidSource)?;
-    Ok(format!("file://{text}"))
+    crate::local_repository::normalize(value.trim()).ok_or(RemoteError::InvalidSource)
 }
 
 #[must_use]
@@ -496,6 +473,10 @@ pub(super) fn trust_repository_identity(value: &str) -> Result<String, RemoteErr
 }
 
 pub(super) fn canonical_repository(value: &str) -> Result<String, RemoteError> {
+    #[cfg(windows)]
+    if (value.starts_with("file://") || Path::new(value).is_absolute()) && value != value.trim() {
+        return Err(RemoteError::InvalidSource);
+    }
     let value = value.trim();
     if let Some(path) = value.strip_prefix("file://") {
         if path.contains('@') {
