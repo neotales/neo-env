@@ -1463,6 +1463,23 @@ fn cached_remote_file(
     project_root: &Path,
     spec: &str,
 ) -> Result<(String, String, String, Vec<u8>), TrustError> {
+    if crate::modules::DirectFileSource::is_direct(spec) {
+        let source =
+            crate::modules::DirectFileSource::parse(spec).map_err(|error| TrustError::Remote {
+                message: error.to_string(),
+            })?;
+        let bytes = crate::modules::cached_direct_file(project_root, &source).map_err(|error| {
+            TrustError::Remote {
+                message: error.to_string(),
+            }
+        })?;
+        return Ok((
+            source.url().into(),
+            source.digest().into(),
+            "document".into(),
+            bytes,
+        ));
+    }
     if let Some(tarball) =
         crate::modules::TarballModule::parse(spec).map_err(|error| TrustError::Remote {
             message: error.to_string(),
@@ -2008,6 +2025,42 @@ mod tests {
         assert!(error.to_string().contains("not valid UTF-8"), "{error}");
         assert!(!store.exists());
         assert!(Contributor::local(&path, "config\n").is_err());
+    }
+
+    #[test]
+    fn direct_file_approval_requires_verified_cached_bytes() {
+        use sha2::{Digest as _, Sha256};
+        let project = TempDir::new().unwrap();
+        let store_root = TempDir::new().unwrap();
+        let store = store_root.path().join("projects.toml");
+        let input = b"tasks:\n  lint: 'true'\n";
+        let digest = format!("{:x}", Sha256::digest(input));
+        let spec = format!("https://example.test/task.yaml#sha256={digest}&type=file");
+        let cache = project
+            .path()
+            .join(neoenv_core::names::PROJECT_MODULE_CACHE)
+            .join("files")
+            .join(&digest);
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(&cache, input).unwrap();
+        let root = project.path().join("neoenv.yaml");
+        fs::write(&root, "format_version: 1\n").unwrap();
+        approve_local_in(&store, &root).unwrap();
+        let contributor = Contributor::remote(
+            "https://example.test/task.yaml",
+            &digest,
+            "document",
+            std::str::from_utf8(input).unwrap(),
+        );
+        assert!(require_execution_in(&store, &root, std::slice::from_ref(&contributor)).is_err());
+        let identity = approve_cached_remote_in(&store, project.path(), &spec).unwrap();
+        assert_eq!(identity.repository, "https://example.test/task.yaml");
+        assert_eq!(identity.commit, digest);
+        let written = read_store_at(&store).unwrap();
+        require_identity(&written, &TrustIdentity::Remote(identity)).unwrap();
+        require_execution_in(&store, &root, &[contributor]).unwrap();
+        fs::write(cache, b"tampered").unwrap();
+        assert!(approve_cached_remote_in(&store, project.path(), &spec).is_err());
     }
 
     #[test]

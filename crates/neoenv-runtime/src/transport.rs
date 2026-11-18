@@ -217,14 +217,13 @@ impl HttpPolicy {
         header: Option<(&str, &str)>,
     ) -> Result<ureq::Response, HttpError> {
         let target = redacted_url(url);
-        let request = ureq::AgentBuilder::new()
+        let builder = ureq::AgentBuilder::new()
             .timeout_connect(self.connect_timeout)
             .timeout_read(self.read_idle_timeout)
             .timeout(self.total_timeout)
             .redirects(redirects)
-            .user_agent(concat!("nenv/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .get(url);
+            .user_agent(concat!("nenv/", env!("CARGO_PKG_VERSION")));
+        let request = builder.build().get(url);
         let request = match header {
             Some((name, value)) => request.set(name, value),
             None => request,

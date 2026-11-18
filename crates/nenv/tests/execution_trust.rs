@@ -458,6 +458,54 @@ fn remote_fixture() -> RemoteFixture {
 }
 
 #[test]
+fn direct_file_module_and_package_require_separate_execution_approval() {
+    for package in [false, true] {
+        let body = "tasks:\n  remote:\n    uses: shell\n    run: 'touch direct-ran'\n";
+        let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let spec = format!("https://example.test/task.yaml#sha256={digest}&type=file");
+        let config = if package {
+            format!(
+                "task_packages:\n  direct:\n    from: '{spec}'\n    task: remote\ntasks:\n  check:\n    uses: package:direct\n"
+            )
+        } else {
+            format!("imports: ['{spec}']\n")
+        };
+        let fixture = Fixture::new(&config);
+        let cache = fixture.path(".neoenv/modules/files").join(&digest);
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(&cache, body).unwrap();
+        fixture.approve_root();
+        let task = if package { "check" } else { "remote" };
+        let denied = fixture.run(&["task", "run", task]);
+        Fixture::assert_trust_refusal(&denied);
+        assert!(!fixture.path("direct-ran").exists());
+        let approved = fixture.run(&["trust", "add", "--remote", &spec]);
+        assert!(approved.status.success(), "{approved:?}");
+        let capability_subject = if package {
+            format!("package:{digest}")
+        } else {
+            format!(
+                "project:{}/task:remote",
+                fixture.project.canonicalize().unwrap().display()
+            )
+        };
+        fs::write(
+            fixture.config.join("neoenv/capabilities.toml"),
+            format!("[[grants]]\nsubject = {capability_subject:?}\ncapability = \"execute\"\n"),
+        )
+        .unwrap();
+        let ran = fixture.run(&["task", "run", task]);
+        assert!(ran.status.success(), "{ran:?}");
+        assert!(fixture.path("direct-ran").exists());
+        fs::remove_file(fixture.path("direct-ran")).unwrap();
+        fs::write(cache, "tampered").unwrap();
+        let denied = fixture.run(&["task", "run", task]);
+        assert!(!denied.status.success(), "{denied:?}");
+        assert!(!fixture.path("direct-ran").exists());
+    }
+}
+
+#[test]
 fn a_repository_allowlist_alone_does_not_grant_execution() {
     let remote = remote_fixture();
     // The cache is populated, verified, and readable without the execution

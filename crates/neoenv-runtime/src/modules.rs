@@ -23,11 +23,13 @@ use crate::paths::{UserDirectory, user_directory};
 use crate::remote::{RemoteError, RemoteModule};
 use crate::transport::HttpPolicy;
 
+mod direct_file;
 mod loader;
 mod tarball;
 #[cfg(test)]
 mod tests;
 
+pub use direct_file::{DirectFileSource, cached_direct_file, fetch_direct_file};
 pub(crate) use loader::ModuleLoader;
 pub use loader::{load_local_modules, load_task_package};
 pub use tarball::fetch_tarball_module;

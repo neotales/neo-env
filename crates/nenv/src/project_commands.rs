@@ -314,6 +314,25 @@ pub(super) fn dispatch_remote(
     command: &RemoteCommand,
     format: OutputFormat,
 ) -> Result<(), Diagnostic> {
+    if let RemoteCommand::Fetch { source, path } | RemoteCommand::Install { source, path } = command
+    {
+        if source.ends_with("&type=file") {
+            let direct = neoenv_runtime::modules::DirectFileSource::parse(source)
+                .map_err(|error| remote_diagnostic(&error))?;
+            let root = project_root(path.as_deref())?;
+            neoenv_runtime::modules::fetch_direct_file(&root, &direct)
+                .map_err(|error| remote_diagnostic(&error))?;
+            return match format {
+                OutputFormat::Text => {
+                    println!("cached: {source}");
+                    Ok(())
+                }
+                OutputFormat::Json => {
+                    print_json(&serde_json::json!({ "source": source, "cached": true }))
+                }
+            };
+        }
+    }
     let (source, action) = match command {
         RemoteCommand::Inspect { source } => (source, None),
         RemoteCommand::Fetch { source, path } | RemoteCommand::Install { source, path } => {

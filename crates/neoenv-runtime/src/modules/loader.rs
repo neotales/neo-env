@@ -2,6 +2,7 @@
 //! postorder composition, and the per-resolution parse cache that keeps a
 //! shared document from being re-read for every package graph.
 
+use super::direct_file::{DirectFileSource, cached_direct_file};
 use super::tarball::{CachedTarball, TarballModule, cached_tarball_details};
 use super::{
     Arc, Component, ConfigSource, Diagnostic, Digest, Format, HashMap, HashSet, ModuleImport, Path,
@@ -88,6 +89,7 @@ struct RemoteLocation {
     commit: String,
     relative_path: String,
     root: PathBuf,
+    direct: Option<DirectFileSource>,
 }
 
 impl RemoteLocation {
@@ -97,6 +99,7 @@ impl RemoteLocation {
             commit: self.commit.clone(),
             relative_path: repository_relative_path(&self.root, path)?,
             root: self.root.clone(),
+            direct: self.direct.clone(),
         })
     }
 }
@@ -231,7 +234,13 @@ impl ModuleLoader {
             fs::canonicalize(source.path()).map_err(|error| io_error(source.path(), &error))?;
         let sha256 = format!("{:x}", Sha256::digest(exact_input.as_bytes()));
         let identity = TaskPackageIdentity {
-            path: canonical_document.display().to_string(),
+            path: location
+                .as_ref()
+                .and_then(|location| location.direct.as_ref())
+                .map_or_else(
+                    || canonical_document.display().to_string(),
+                    |direct| format!("{}#sha256={}&type=file", direct.url(), direct.digest()),
+                ),
             sha256,
             export: package.task.clone(),
             root: root.clone(),
@@ -251,16 +260,28 @@ impl ModuleLoader {
         origin: ModuleOrigin,
         limits: &ResourceBudget,
         imported: bool,
+        direct: Option<&DirectFileSource>,
     ) -> Result<Arc<ParsedModule>, Diagnostic> {
         let key = (path.to_owned(), origin);
-        if let Some(document) = self.documents.get(&key) {
+        if let Some(document) = self.documents.get(&key).filter(|_| direct.is_none()) {
             if imported && document.format == Format::Neoenv {
                 return Err(imported_neoenv_error(path));
             }
             return Ok(Arc::clone(document));
         }
-        let input = read_text_file(path, limits).map_err(|error| io_error(path, &error))?;
-        let format = Format::from_path(path)?;
+        let (input, format) = if let Some(direct) = direct {
+            let bytes =
+                cached_direct_file(&self.root, direct).map_err(|error| remote_error(&error))?;
+            let input = String::from_utf8(bytes).map_err(|error| {
+                validation("NEO615", format!("direct file is not UTF-8: {error}"))
+            })?;
+            (input, direct.format())
+        } else {
+            (
+                read_text_file(path, limits).map_err(|error| io_error(path, &error))?,
+                Format::from_path(path)?,
+            )
+        };
         if imported && format == Format::Neoenv {
             return Err(imported_neoenv_error(path));
         }
@@ -268,15 +289,16 @@ impl ModuleLoader {
         {
             self.parsed_documents += 1;
         }
-        let project =
-            parse_project_with_profile(path, &input, Format::from_path(path)?, self.profile)?;
+        let project = parse_project_with_profile(path, &input, format, self.profile)?;
         let document = Arc::new(ParsedModule {
             input,
             project,
             source: ConfigSource::module_with_origin(path.to_owned(), origin),
             format,
         });
-        self.documents.insert(key, Arc::clone(&document));
+        if direct.is_none() {
+            self.documents.insert(key, Arc::clone(&document));
+        }
         Ok(document)
     }
 }
@@ -393,9 +415,42 @@ fn visit(
             .remote_locations
             .insert(path.to_owned(), location.clone());
     }
-    let document = module_loader.document(path, origin, &budget.limits, !visiting.is_empty())?;
+    let direct = location.and_then(|location| location.direct.as_ref());
+    let document =
+        module_loader.document(path, origin, &budget.limits, !visiting.is_empty(), direct)?;
     let input = document.input.clone();
     let project = document.project.clone();
+    if direct.is_some()
+        && (!project.imports.is_empty()
+            || !project.task_packages.is_empty()
+            || !project.dotenv.is_empty()
+            || !project.inventory_files.is_empty()
+            || !project.inventories.is_empty()
+            || !project.vaults.is_empty()
+            || !project.path.is_empty()
+            || !project.tools.is_empty()
+            || !project.jobs.is_empty()
+            || !project.deployments.is_empty()
+            || !project.task_dirs.local.is_empty()
+            || !project.task_dirs.global.is_empty()
+            || !project.workspace.members.is_empty()
+            || !project.workspace.aliases.is_empty()
+            || project.tasks.values().any(|task| {
+                task.action.as_ref().is_some_and(|action| {
+                    action.source.is_some()
+                        || action.destination.is_some()
+                        || action.cwd.is_some()
+                        || !action.files.is_empty()
+                        || !action.dotenv.is_empty()
+                        || action.with.contains_key("values")
+                })
+            }))
+    {
+        return Err(validation(
+            "NEO632",
+            "direct files cannot reference nested documents or packages".into(),
+        ));
+    }
     let source = document.source.clone();
     let contributor = match location {
         Some(location) => Ok(Contributor::remote(
@@ -734,6 +789,23 @@ fn module_path(
     source: &Path,
     import: &str,
 ) -> Result<(PathBuf, ModuleOrigin, Option<RemoteLocation>), Diagnostic> {
+    if DirectFileSource::is_direct(import) {
+        let direct = DirectFileSource::parse(import).map_err(|error| remote_error(&error))?;
+        cached_direct_file(root, &direct).map_err(|error| remote_error(&error))?;
+        let path = fs::canonicalize(direct.path(root))
+            .map_err(|error| io_error(&direct.path(root), &error))?;
+        return Ok((
+            path.clone(),
+            ModuleOrigin::Remote,
+            Some(RemoteLocation {
+                repository: direct.url().into(),
+                commit: direct.digest().into(),
+                relative_path: "document".into(),
+                root: path.parent().unwrap_or(root).to_owned(),
+                direct: Some(direct),
+            }),
+        ));
+    }
     if let Some(tarball) = TarballModule::parse(import).map_err(|error| remote_error(&error))? {
         let cached: CachedTarball =
             cached_tarball_details(root, &tarball).map_err(|error| remote_error(&error))?;
@@ -748,6 +820,7 @@ fn module_path(
                 commit: cached.digest,
                 relative_path,
                 root: cached.source_root,
+                direct: None,
             }),
         ));
     }
@@ -764,6 +837,7 @@ fn module_path(
                 commit: cached.commit,
                 relative_path,
                 root: cached.source_root,
+                direct: None,
             }),
         ));
     }
@@ -878,6 +952,25 @@ fn task_package_target(
         return Err(validation(
             "NEO621",
             "task package source must not be empty".into(),
+        ));
+    }
+    if DirectFileSource::is_direct(reference) {
+        let (path, origin, location) = module_path(project_root, importing_source, reference)?;
+        let root = path
+            .parent()
+            .ok_or_else(|| validation("NEO623", "direct file has no cache directory".into()))?
+            .to_owned();
+        return Ok(TaskPackageTarget {
+            root,
+            path,
+            origin,
+            location,
+        });
+    }
+    if declaring_remote.is_some_and(|location| location.direct.is_some()) {
+        return Err(validation(
+            "NEO623",
+            "direct files cannot reference relative task packages".into(),
         ));
     }
     if is_remote(reference) || crate::remote::is_local_git(reference) {
@@ -1027,6 +1120,7 @@ fn declaring_relative_task_package(
             commit: declaring.commit.clone(),
             relative_path,
             root: declaring.root.clone(),
+            direct: None,
         }),
     })
 }
@@ -1073,6 +1167,7 @@ fn remote_task_package_target(
             commit: cached.commit,
             relative_path,
             root: cached.source_root,
+            direct: None,
         }),
     })
 }

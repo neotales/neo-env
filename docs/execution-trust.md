@@ -159,6 +159,96 @@ file**, and approving the file does not authorize fetching anything. A package
 from remote content is external, so its task also needs an explicit `execute`
 capability grant for `package:<sha256>`.
 
+## Pinned HTTPS direct files
+
+A YAML or TOML document can be fetched as a **single file** using the explicit
+`#sha256=<64 hexadecimal digits>&type=file` fragment. The `type=file` marker is
+required: without it, the existing `#sha256=...` module syntax denotes a
+tarball. Replace the example digest below with the SHA-256 of the exact file
+bytes, obtained from a source you trust; the all-`a` value is illustrative.
+
+For a module:
+
+```yaml
+imports:
+  - "https://example.org/module.yaml#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&type=file"
+```
+
+For a task package, in the project's own configuration:
+
+```yaml
+task_packages:
+  checks:
+    from: "https://example.org/checks.toml#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&type=file"
+    task: lint
+tasks:
+  check:
+    uses: package:checks
+```
+
+Populate the cache only with an explicit user-initiated fetch, then separately
+approve the project and the cached file for execution:
+
+```console
+nenv remote fetch 'https://example.org/checks.toml#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&type=file'
+nenv trust add --project neoenv.yaml
+nenv trust add --remote 'https://example.org/checks.toml#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&type=file'
+```
+
+Fetching is a user-directed network operation, **not** an execution approval;
+`trust add --remote` is the separate decision to approve the cached bytes.
+The package task also requires an `execute` capability grant for
+`package:<sha256>` (using the same lowercase digest). For example, a grant in
+the user capability store is:
+
+```toml
+[[grants]]
+subject = "package:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+capability = "execute"
+```
+
+A module task likewise requires the existing external-task capability grant.
+Approving content does not grant capabilities. The cache is reverified before
+parsing; a digest mismatch or later cache tampering fails closed. The URL must
+use HTTPS, end in `.yaml`, `.yml`, or `.toml`, and contain no userinfo, query,
+or other fragment. The current parser also refuses any literal `@` anywhere
+in the URL, and spaces or control characters. Redirects are not followed.
+Downloads are capped at the one-MiB document budget and use the configured HTTP
+deadlines.
+
+There is **no public-address-only or SSRF filter**: HTTPS hosts resolving to
+loopback, private networks, or other locally reachable services are permitted.
+Before explicitly fetching, inspect the URL and understand that it can contact
+such services. The checksum verifies bytes, not the publisher or destination.
+
+A direct file is not a verified directory tree. Nested module imports, task
+packages, dotenv and inventory files, task file inputs/outputs and working
+directories, task runner directories, workspace paths, PATH entries, tool
+declarations, vaults, inventories, jobs, and deployments are currently refused
+in a direct file. This conservative restriction also applies to independently
+pinned nested imports; place such dependencies in the local project instead.
+An approved inline command can still access files or the network according to
+its capabilities and the operating system; the digest is not a sandbox.
+
+### HTTPS test isolation
+
+The controlled local HTTPS tests copy the source into a temporary directory and
+build a separate fixture binary with a test-only transport modification. That
+binary accepts a temporary test root certificate and still verifies the
+certificate chain and hostname. The actual source and distributable contain no
+test-root override or embedded fixture certificate. Both nested Cargo builds
+use `--locked` and a per-run temporary target; the test-only dependency change
+is reflected only in the temporary source copy's lockfile.
+
+The tests separately build a release-mode binary from the unmodified source and
+check for its `UnknownCA` handshake alert when given the fixture certificate,
+even when the fixture variable is set. The hostname-mismatch test uses the
+fixture binary with its test root trusted and first checks a matching-hostname
+positive control. It checks for a `BadCertificate` handshake alert, but does
+not contact a publicly trusted, hostname-mismatched server with the release
+binary. The release-mode test build disables optimization for test runtime,
+while retaining release-mode disabled debug assertions.
+
 ## Local git fetch
 
 A local repository is populated only by an explicit `nenv remote fetch`, and
@@ -189,9 +279,8 @@ for every Git child, and protocol policy is `protocol.allow=never` with only
 therefore cannot turn the local path into HTTPS or SSH, and the non-file
 protocols are refused even if a rewrite were applied.
 
-For this slice, `nenv remote fetch` refuses a non-local source with an explicit
-non-local fetch diagnostic. GitHub and network transport are not enabled, not
-merely unclaimed.
+For Git repository references, `nenv remote fetch` refuses non-local sources.
+The distinct HTTPS direct-file fetch described above does use the network.
 
 ## Limits in this change
 
@@ -216,8 +305,5 @@ gitlink, or a file-type change fails closed.
 A config-directed import or task package still reads a populated cache and never
 fetches. The only fetch path for a local repository is the explicit
 `nenv remote fetch` above; its result is a normal cache entry subject to the
-same verification and trust gate. **Non-local fetch is refused in this build**
-with an explicit diagnostic, so no GitHub, network, or SSH transport is
-reachable. Tests drive local fetch and verification with a local Git repository,
-with no network.
-
+same verification and trust gate. Non-local Git repository fetch is refused;
+the explicit direct-file HTTPS fetch is a separate network transport.

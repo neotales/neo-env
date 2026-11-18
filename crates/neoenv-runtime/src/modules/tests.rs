@@ -9,6 +9,111 @@ use flate2::{Compression, write::GzEncoder};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+fn cached_direct(root: &std::path::Path, name: &str, input: &[u8]) -> (String, std::path::PathBuf) {
+    let digest = format!("{:x}", Sha256::digest(input));
+    let cache = root
+        .join(neoenv_core::names::PROJECT_MODULE_CACHE)
+        .join("files")
+        .join(&digest);
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    fs::write(&cache, input).unwrap();
+    (
+        format!("https://example.test/{name}#sha256={digest}&type=file"),
+        cache,
+    )
+}
+
+#[test]
+fn direct_file_module_and_task_package_load_verified_bytes() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("neoenv.yaml");
+    let (module, _) = cached_direct(temp.path(), "module.toml", b"[env]\nANSWER = 'yes'\n");
+    fs::write(&root, format!("imports: [\"{module}\"]\n")).unwrap();
+    let modules = load_local_modules(temp.path(), &root).unwrap();
+    assert_eq!(modules[0].1.environment[0].value, "yes");
+    assert!(modules[0].0.is_remote_module());
+    let (package, cache) = cached_direct(temp.path(), "task.yaml", b"tasks:\n  lint: 'true'\n");
+    let mut loader =
+        ModuleLoader::with_profile(temp.path(), neoenv_config::ConfigProfile::process_profile())
+            .unwrap();
+    let loaded = loader
+        .load_task_package_with_identity(
+            &root,
+            &TaskPackage {
+                from: package.clone(),
+                task: "lint".into(),
+            },
+        )
+        .unwrap();
+    assert!(loaded.project.tasks.contains_key("lint"));
+    assert!(loaded.identity.external);
+    assert!(loader.take_contributors().iter().any(|item| matches!(&item.identity, crate::trust::TrustIdentity::Remote(remote) if remote.repository == "https://example.test/task.yaml")));
+    fs::write(cache, b"tampered").unwrap();
+    assert!(
+        loader
+            .load_task_package_with_identity(
+                &root,
+                &TaskPackage {
+                    from: package,
+                    task: "lint".into()
+                }
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn direct_file_nested_imports_are_refused() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("neoenv.yaml");
+    let (module, _) = cached_direct(temp.path(), "module.yaml", b"imports: [../outside.yaml]\n");
+    fs::write(&root, format!("imports: [\"{module}\"]\n")).unwrap();
+    assert_eq!(
+        load_local_modules(temp.path(), &root).unwrap_err().code,
+        "NEO632"
+    );
+}
+
+#[test]
+fn direct_file_rejects_path_bearing_declarations_for_modules_and_packages() {
+    let cases = [
+        "imports: [../outside.yaml]\n",
+        "task_packages:\n  nested: ./other.yaml\n",
+        "dotenv: .env\n",
+        "inventory_files: [other.yaml]\n",
+        "inventories:\n  lab:\n    defaults:\n      identity_file: fixture-key\n    hosts: {}\n",
+        "vaults:\n  work:\n    driver: keepass\n    path: secret.kdbx\n    secret: nsv://machine/work\n",
+        "task_dirs:\n  local: runners\n",
+        "workspace:\n  members: [other]\n",
+        "path:\n  - prepend: bin\n",
+        "tools:\n  - id: demo\n    version: 1\n",
+        "tasks:\n  lint:\n    uses: shell\n    run: 'true'\n    cwd: ../outside\n",
+        "tasks:\n  lint:\n    uses: shell\n    run: 'true'\n    dotenv: other.env\n",
+        "tasks:\n  lint:\n    uses: render\n    source: ../outside\n    destination: out\n",
+        "tasks:\n  lint:\n    uses: tmpl\n    with:\n      files: [other:out]\n",
+        "tasks:\n  lint:\n    uses: tmpl\n    with:\n      values: other.yaml\n",
+        "jobs:\n  example:\n    cwd: other\n    steps: [lint]\n",
+    ];
+    for body in cases {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("neoenv.yaml");
+        let (spec, _) = cached_direct(temp.path(), "module.yaml", body.as_bytes());
+        fs::write(&root, format!("imports: [\"{spec}\"]\n")).unwrap();
+        let error = load_local_modules(temp.path(), &root).unwrap_err();
+        assert_eq!(error.code, "NEO632", "{body}: {error:?}");
+        let error = load_task_package(
+            temp.path(),
+            &root,
+            &TaskPackage {
+                from: spec,
+                task: "lint".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "NEO632", "{body}: {error:?}");
+    }
+}
+
 #[test]
 fn loads_nested_modules_before_importers_and_preserves_paths() {
     let temp = TempDir::new().unwrap();
