@@ -10,6 +10,11 @@
 
 use std::{fs, path::Path};
 
+/// Creates a fixture under the physical temp directory for system path checks.
+pub fn secure_temp_dir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+}
+
 /// Approves every regular file below `root` into the store at `config_home`.
 ///
 /// Extra records for scripts and templates are harmless; trust is per file and

@@ -1007,6 +1007,85 @@ struct LocalGitFixture {
     package_sha256: String,
 }
 
+// On fixture failure, probe Git with the production protocol restrictions.
+// Report only fixed classifications; never print Git's path-bearing stderr.
+fn diagnose_local_git(local: &LocalGitFixture) -> String {
+    let target = TempDir::new().unwrap();
+    let origin = neoenv_runtime::remote::RemoteModule::parse(&local.spec).unwrap();
+    let path = origin.local_path().unwrap();
+    #[cfg(windows)]
+    let path = path.replace('/', "\\");
+    let mut reports = Vec::new();
+    let options = [
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.file.allow=always",
+        "-c",
+        "protocol.https.allow=never",
+        "-c",
+        "protocol.ssh.allow=never",
+        "-c",
+        "protocol.git.allow=never",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ];
+    let reference = local
+        .spec
+        .rsplit_once('@')
+        .unwrap()
+        .1
+        .split("//")
+        .next()
+        .unwrap();
+    for args in [
+        vec!["init"],
+        vec!["fetch", "--depth=1", "--no-tags", path.as_ref(), reference],
+    ] {
+        let output = Command::new("git")
+            .args(options)
+            .arg("-C")
+            .arg(target.path())
+            .args(&args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        let labels = [
+            ("config", "config"),
+            ("null", "/dev/null"),
+            ("protocol", "protocol"),
+            ("repository", "repository"),
+            ("not_found", "no such file"),
+            ("access", "permission denied"),
+            ("ownership", "dubious ownership"),
+            ("invalid_argument", "invalid argument"),
+            ("not_git", "not a git repository"),
+            (
+                "not_git_repository",
+                "does not appear to be a git repository",
+            ),
+            ("revision", "couldn't find remote ref"),
+        ]
+        .iter()
+        .filter_map(|(label, needle)| stderr.contains(needle).then_some(*label))
+        .collect::<Vec<_>>();
+        reports.push(format!(
+            "{} status={} classes={labels:?}",
+            args[0], output.status
+        ));
+    }
+    reports.join("; ")
+}
+
 fn local_git_fixture() -> LocalGitFixture {
     let fixture = Fixture::new("format_version: 1\n");
     let origin = fixture.root.path().join("origin");
@@ -1106,7 +1185,12 @@ fn a_local_git_task_package_fetches_then_needs_execution_trust() {
         .unwrap();
     assert!(
         fetched.status.success(),
-        "a rewritten local path must not be followed: {fetched:?}"
+        "a rewritten local path must not be followed: {fetched:?}; diagnostic: {}",
+        if fetched.status.success() {
+            String::new()
+        } else {
+            diagnose_local_git(&local)
+        }
     );
     assert!(local.cached.is_file(), "subfolder document was not cached");
     assert!(
@@ -1191,9 +1275,10 @@ fn a_local_git_branch_or_tag_is_not_an_execution_identity() {
     }
 
     let branch_spec = format!("{}@main//tasks/lint/task.yaml", local.origin.display());
+    let branch_spec = serde_json::to_string(&branch_spec).unwrap();
     fixture.write(
         "neoenv.yaml",
-        &format!("task_packages:\n  lint:\n    from: \"{branch_spec}\"\n    task: lint\n"),
+        &format!("task_packages:\n  lint:\n    from: {branch_spec}\n    task: lint\n"),
     );
     let inspect = fixture.run(&["inspect"]);
     assert_eq!(inspect.status.code(), Some(3), "{inspect:?}");

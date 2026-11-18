@@ -1440,7 +1440,7 @@ fn assert_no_installer_temporary_content(root: &Path) {
 
 #[test]
 fn global_lifecycle_reports_the_system_scope() {
-    let directory = TempDir::new().unwrap();
+    let directory = support::secure_temp_dir();
     let user_config = directory.path().join("user-config");
     let user_data = directory.path().join("user-data");
     let system_config = directory.path().join("system-config");

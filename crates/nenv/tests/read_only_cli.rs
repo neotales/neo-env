@@ -120,7 +120,9 @@ fn tool_which_without_a_lockfile_is_a_clean_not_found_result() {
 
 #[test]
 fn global_use_uses_system_scope_without_mise() {
-    let (directory, _) = write_project("format_version: 1\n");
+    let directory = support::secure_temp_dir();
+    fs::write(directory.path().join("neoenv.yaml"), "format_version: 1\n").unwrap();
+    support::approve_tree(config_home(), directory.path());
     let configuration_home = directory.path().join("configuration");
     let data_home = directory.path().join("data");
     let system_config = directory.path().join("system-config");
