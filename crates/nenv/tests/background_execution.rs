@@ -380,7 +380,6 @@ tasks:
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn default_exec_matches_portable_parser_and_keeps_args_literal() {
     let root = project(
         r"
@@ -408,7 +407,6 @@ tasks:
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn passthrough_reaches_every_executed_pipeline_in_a_chain() {
     let root = project(
         r"
@@ -416,6 +414,18 @@ tasks:
   foreground:
     run: 'printf %s A; printf %s B && false || printf %s C'
     args: [VALUE]
+",
+    );
+    let stdout = success(&run(&root, &["run", "foreground"]));
+    assert!(stdout.contains("AVALUEBVALUECVALUE"), "{stdout}");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn background_passthrough_reaches_executed_pipeline_in_a_chain() {
+    let root = project(
+        r"
+tasks:
   background:
     background: true
     run: 'printf %s A; printf %s B && false || printf %s C'
@@ -425,14 +435,11 @@ tasks:
     run: 'true'
 ",
     );
-    for task in ["foreground", "finish"] {
-        let stdout = success(&run(&root, &["run", task]));
-        assert!(stdout.contains("AVALUEBVALUECVALUE"), "{stdout}");
-    }
+    let stdout = success(&run(&root, &["run", "finish"]));
+    assert!(stdout.contains("AVALUEBVALUECVALUE"), "{stdout}");
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn foreground_success_preserves_detached_descendants_and_pipe_eof() {
     let root = project(
         r#"
@@ -452,7 +459,6 @@ tasks:
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn foreground_timeout_stops_descendant_holding_pipeline_open() {
     let root = project(
         r#"
@@ -532,7 +538,6 @@ fn job_execution_repairs_inherited_ignored_sigchld() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn exec_template_if_else_matches_portable_and_argv_keeps_template_literal() {
     let root = project(
         r"
@@ -548,13 +553,6 @@ tasks:
     uses: argv
     run: printf
     args: ['{{ if .env.FEATURE }}enabled{{ else }}disabled{{ end }}']
-  background:
-    background: true
-    env: {FEATURE: enabled}
-    run: '{{ if .env.FEATURE }}printf background-enabled{{ else }}printf background-disabled{{ end }}'
-  finish:
-    wait: [background]
-    run: 'true'
 ",
     );
     for task in ["default", "portable"] {
@@ -568,6 +566,23 @@ tasks:
             .contains("{{ if .env.FEATURE }}enabled{{ else }}disabled{{ end }}"),
         "argv must not render templates"
     );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn background_exec_template_uses_the_same_rendering() {
+    let root = project(
+        r"
+tasks:
+  background:
+    background: true
+    env: {FEATURE: enabled}
+    run: '{{ if .env.FEATURE }}printf background-enabled{{ else }}printf background-disabled{{ end }}'
+  finish:
+    wait: [background]
+    run: 'true'
+",
+    );
     assert!(
         success(&run(&root, &["run", "finish"])).contains("background-enabled"),
         "background exec must use the same template rendering"
@@ -577,7 +592,7 @@ tasks:
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn execution_reports_platform_unavailability_without_running_the_task() {
-    let root = project("tasks: {unsupported: {run: 'touch should-not-run'}}");
+    let root = project("tasks: {unsupported: {background: true, run: 'touch should-not-run'}}");
     let output = run(&root, &["run", "unsupported"]);
     assert!(!output.status.success(), "{output:?}");
     assert!(
@@ -589,7 +604,6 @@ fn execution_reports_platform_unavailability_without_running_the_task() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn jobs_have_an_overall_deadline_and_do_not_run_later_steps_after_it() {
     let root = project(
         r"
