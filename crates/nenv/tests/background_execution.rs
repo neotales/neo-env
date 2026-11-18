@@ -93,6 +93,11 @@ fn success(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
 
+// The markers prove overlap and ordering; the generous finite polling and job
+// budgets are deadlock guards, not performance assertions. Each supervised
+// step authenticates the executable before it can create a marker, which is
+// slow for large debug binaries on a busy host. Timeout behavior itself is
+// covered by the dedicated deadline tests below.
 #[test]
 fn job_steps_overlap_until_an_id_wait_and_keep_default_step_order() {
     let root = project(
@@ -103,11 +108,11 @@ jobs:
       - id: compiler
         background: true
         uses: shell
-        timeout: 10s
+        timeout: 120s
         run: |
-          for n in $(seq 1 200); do
+          for n in $(seq 1 1200); do
             if test -f release; then echo COMPILED=yes > "$NEOENV_ENV"; exit 0; fi
-            sleep 0.01
+            sleep 0.05
           done
           exit 91
       - uses: shell
@@ -133,15 +138,15 @@ fn background_jobs_overlap_as_whole_sequences_and_publish_only_on_join() {
         r#"
 jobs:
   worker:
-    timeout: 10s
+    timeout: 120s
     steps:
       - uses: shell
         run: touch started
       - uses: shell
         run: |
-          for n in $(seq 1 200); do
+          for n in $(seq 1 1200); do
             if test -f release; then echo JOB_VALUE=joined > "$NEOENV_ENV"; exit 0; fi
-            sleep 0.01
+            sleep 0.05
           done
           exit 91
   release:
@@ -149,7 +154,7 @@ jobs:
       - uses: shell
         run: |
           test -z "$JOB_VALUE" || exit 93
-          for n in $(seq 1 200); do test -f started && touch release && exit 0; sleep 0.01; done
+          for n in $(seq 1 1200); do test -f started && touch release && exit 0; sleep 0.05; done
           exit 92
   finish:
     needs: [worker, release]
@@ -173,20 +178,20 @@ fn independent_job_dependencies_overlap_by_default_and_join_before_the_dependent
         r"
 jobs:
   left:
-    timeout: 10s
+    timeout: 120s
     steps:
       - uses: shell
         run: |
           touch left
-          for n in $(seq 1 200); do test -f right && exit 0; sleep 0.01; done
+          for n in $(seq 1 1200); do test -f right && exit 0; sleep 0.05; done
           exit 91
   right:
-    timeout: 10s
+    timeout: 120s
     steps:
       - uses: shell
         run: |
           touch right
-          for n in $(seq 1 200); do test -f left && exit 0; sleep 0.01; done
+          for n in $(seq 1 1200); do test -f left && exit 0; sleep 0.05; done
           exit 92
   finish:
     needs: [left, right]
@@ -207,11 +212,11 @@ jobs:
   x:
     steps:
       - uses: shell
-        run: 'touch x-started; for n in $(seq 1 500); do if test -f y-started; then touch x-finished; exit 0; fi; sleep 0.01; done; exit 91'
+        run: 'touch x-started; for n in $(seq 1 1200); do if test -f y-started; then touch x-finished; exit 0; fi; sleep 0.05; done; exit 91'
   y:
     steps:
       - uses: shell
-        run: 'touch y-started; for n in $(seq 1 500); do if test -f x-started; then touch y-finished; exit 0; fi; sleep 0.01; done; exit 92'
+        run: 'touch y-started; for n in $(seq 1 1200); do if test -f x-started; then touch y-finished; exit 0; fi; sleep 0.05; done; exit 92'
   a:
     needs: [x]
     steps: [{{uses: shell, run: '{CHECK_A}'}}]
@@ -235,7 +240,7 @@ jobs:
         .env("NEOENV_STATE_HOME", root.path().join("state"))
         .env("NEOENV_CACHE_HOME", root.path().join("cache"))
         .current_dir(root.path());
-    let output = bounded_output(&mut command, Duration::from_secs(20))
+    let output = bounded_output(&mut command, Duration::from_secs(180))
         .expect("cross-branch job graph timed out");
     success(&output);
     assert!(root.path().join("root-finished").exists());

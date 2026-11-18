@@ -293,22 +293,33 @@ fn receive_stdin(socket: &UnixStream) -> io::Result<std::os::fd::OwnedFd> {
     let mut data = [0];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+    // Linux applies close-on-exec atomically while receiving descriptors. On
+    // other Unix targets this private helper is still single-threaded and does
+    // not spawn children before this receive, so fcntl below cannot race an
+    // exec in this process.
+    #[cfg(target_os = "linux")]
+    let flags = RecvFlags::CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = RecvFlags::empty();
     let result = recvmsg(
         socket,
         &mut [IoSliceMut::new(&mut data)],
         &mut ancillary,
-        RecvFlags::CMSG_CLOEXEC,
+        flags,
     )?;
     if result.bytes != 1 || data != *b"I" {
         return Err(io::Error::other("invalid stdin descriptor message"));
     }
-    ancillary
+    let fd = ancillary
         .drain()
         .find_map(|message| match message {
             RecvAncillaryMessage::ScmRights(mut rights) => rights.next(),
             _ => None,
         })
-        .ok_or_else(|| io::Error::other("missing stdin descriptor"))
+        .ok_or_else(|| io::Error::other("missing stdin descriptor"))?;
+    let flags = rustix::io::fcntl_getfd(&fd)?;
+    rustix::io::fcntl_setfd(&fd, flags | rustix::io::FdFlags::CLOEXEC)?;
+    Ok(fd)
 }
 
 #[cfg(target_os = "linux")]

@@ -27,6 +27,7 @@ tempfile.workspace = true
 rustix = { version = "1.1.6", features = ["fs"] }
 
 [dev-dependencies]
+nix = { workspace = true, features = ["fs"] }
 tempfile.workspace = true
 
 [lints.rust]

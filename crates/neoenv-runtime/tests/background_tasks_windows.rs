@@ -101,13 +101,18 @@ fn host(root: &Path, cancel: bool) {
             },
             &[],
             TaskRunOptions {
+                ssh_output_to_stderr: false,
+                ssh_secret_values: &[],
+                inventories: None,
                 dry_run: false,
                 cancellation: &cancellation,
                 capability_grants: None,
                 capability_policy_source: None,
                 remote_tasks: None,
                 task_directories: TaskRunnerDirectories::default(),
+                managed_runtimes: &[],
                 input_values: None,
+                vaults: None,
                 owned_backend: Some(CooperativeOwnedBackend::with_exclusive_child_waits(
                     &executable,
                 )),

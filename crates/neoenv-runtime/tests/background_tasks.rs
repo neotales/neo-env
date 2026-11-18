@@ -974,27 +974,63 @@ tasks:
   pipeline:
     background: true
     uses: portable
-    run: "sh -c 'head -c 262144 /dev/zero; sleep 100 & echo $! > child.pid' | sh -c 'cat > received'"
+    timeout: 120s
+    run: "sh -c 'head -c 262144 /dev/zero; wait_ack() { for n in $(seq 1 1200); do test -f watchdog.ready && return 0; sleep 0.05; done; echo expired > watchdog.expired; return 1; }; (wait_ack && exec sleep 100) & echo $! > child.pid; wait_ack || exit 91' | sh -c 'cat > received'"
   finish:
     wait: [pipeline]
 "#,
     );
     let cancellation = TaskCancellation::new();
-    let report = std::thread::scope(|scope| {
+    let (report, watchdog_ok) = std::thread::scope(|scope| {
         let (finished, completion) = std::sync::mpsc::channel();
         let cancellation = &cancellation;
-        scope.spawn(move || {
-            // This is a harness watchdog, not a task timeout. A regression must
-            // fail as Cancelled rather than hang or wait for the 100s child.
-            if completion.recv_timeout(Duration::from_secs(3)).is_err() {
+        let marker = root.path().join("child.pid");
+        let acknowledgement = root.path().join("watchdog.ready");
+        let watchdog = scope.spawn(move || {
+            // Bound startup separately: the watchdog for pipe EOF must start
+            // only after the stage has actually launched its descendant.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !marker.exists() {
+                if completion.recv_timeout(Duration::from_millis(50)).is_ok() {
+                    return false;
+                }
+                if Instant::now() >= deadline {
+                    cancellation.cancel();
+                    return false;
+                }
+            }
+            // The stage cannot successfully exit and the descendant's 100s
+            // sleep cannot start before this acknowledgement. Expiry writes a
+            // failure marker, even if pipeline status hides the stage failure.
+            let ready_at = Instant::now();
+            let deadline = ready_at + Duration::from_secs(3);
+            if fs::write(acknowledgement, "").is_err() {
                 cancellation.cancel();
+                return false;
+            }
+            // A regression must fail as Cancelled instead of waiting for the
+            // 100s child. This is a separate post-readiness deadline.
+            match completion.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(completed_at) if (ready_at..=deadline).contains(&completed_at) => true,
+                _ => {
+                    cancellation.cancel();
+                    false
+                }
             }
         });
         let report = execute(root.path(), &definitions, cancellation, false);
-        let _ = finished.send(());
-        report
+        let _ = finished.send(Instant::now());
+        (report, watchdog.join().unwrap())
     });
     assert_child_stopped(root.path());
+    assert!(
+        !root.path().join("watchdog.expired").exists(),
+        "fixture readiness wait expired"
+    );
+    assert!(
+        watchdog_ok,
+        "pipeline did not complete within the EOF deadline"
+    );
     assert_eq!(
         outcomes(&report),
         [

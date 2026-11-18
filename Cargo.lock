@@ -2314,6 +2314,7 @@ dependencies = [
  "neoenv-core",
  "neoenv-runtime",
  "neotales-env",
+ "nix 0.31.4",
  "rustix",
  "serde",
  "serde_json",

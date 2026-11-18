@@ -96,10 +96,9 @@ fn bun_input_fifo_is_rejected_without_blocking() {
     }
     let temp = TempDir::new().unwrap();
     let fifo = temp.path().join("fifo");
-    rustix::fs::mkfifoat(
-        rustix::fs::CWD,
+    nix::unistd::mkfifo(
         &fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
     )
     .unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())

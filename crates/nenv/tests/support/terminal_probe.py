@@ -232,7 +232,9 @@ def probe(mode, binary):
             assert left_group == right_group and left_group != pid
             os.write(master, b"\x1a" if mode == "suspend" else b"\x03")
             if mode == "suspend":
-                read_until(b"READY_RECOVERY", seconds=3)
+                # Recovery launches another authenticated supervisor; waiting
+                # for its readiness also includes debug-binary hashing.
+                read_until(b"READY_RECOVERY", seconds=30)
                 os.write(master, b"recovered\n")
                 read_until(b"RECOVERED_OK", seconds=3)
 

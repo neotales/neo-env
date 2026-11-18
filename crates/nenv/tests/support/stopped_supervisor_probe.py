@@ -23,7 +23,6 @@ def kill_owned(pid, session):
         os.close(descriptor)
 
 
-started = time.monotonic()
 process = subprocess.Popen(
     [sys.argv[1], "run", "stalled"],
     stdin=subprocess.DEVNULL,
@@ -34,11 +33,15 @@ process = subprocess.Popen(
 settled = False
 owned_fds = []
 try:
-    deadline = time.monotonic() + 3
+    # Authentication of a large debug executable can take much longer than the
+    # task deadline on a busy host. Bound startup separately from cleanup.
+    deadline = time.monotonic() + 60
     while not pathlib.Path("stop.sent").exists() and time.monotonic() < deadline:
         if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
             break
         time.sleep(0.01)
+    assert pathlib.Path("stop.sent").exists(), "the test did not stop the supervisor"
+    stopped = time.monotonic()
     for marker in ("supervisor.pid", "stage.pid"):
         path = pathlib.Path(marker)
         if not path.exists():
@@ -58,9 +61,8 @@ try:
                 os.close(descriptor)
     stdout, stderr = process.communicate(timeout=10)
     settled = True
-    elapsed = time.monotonic() - started
+    elapsed = time.monotonic() - stopped
     assert pathlib.Path("supervisor.pid").exists(), (stdout, stderr)
-    assert pathlib.Path("stop.sent").exists(), "the test did not stop the supervisor"
     assert process.returncode != 0, (stdout, stderr)
     assert b"stalled TimedOut" in stdout, (stdout, stderr)
     assert elapsed < 8, elapsed
