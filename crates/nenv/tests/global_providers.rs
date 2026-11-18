@@ -1604,7 +1604,12 @@ fn github_global_install_selects_metadata_asset_and_repeats_offline() {
 
 #[test]
 fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
-    fn run_case(manifest_assets: &str, pinned_digest: Option<String>, expected: bool) {
+    fn run_case(
+        manifest_assets: &str,
+        pinned_digest: Option<String>,
+        expected_success: bool,
+        expected_requests: usize,
+    ) {
         let directory = TempDir::new().unwrap();
         let config_home = directory.path().join("config");
         let data_home = directory.path().join("data");
@@ -1618,7 +1623,6 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
             .replace("{digest}", &artifact_digest);
         let manifest = format!("package: owner/tool\nassets:\n{manifest_assets}");
         let manifest_digest = format!("{:x}", Sha256::digest(manifest.as_bytes()));
-        let expected_requests = usize::from(expected) + 1;
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server_thread = thread::spawn(move || {
@@ -1687,15 +1691,15 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
         let served = server.stop();
         assert_eq!(
             served, expected_requests,
-            "Aqua fixture served fewer requests than expected (expected success: {expected})"
+            "Aqua fixture request count for expected success={expected_success}"
         );
         assert_eq!(
             output.status.success(),
-            expected,
+            expected_success,
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        if expected {
+        if expected_success {
             let config = fs::read_to_string(global_config_path(&config_home)).unwrap();
             assert!(config.contains(&manifest_digest));
             assert!(config.contains("0123456789012345678901234567890123456789"));
@@ -1705,11 +1709,15 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
         }
     }
 
-    let correct_assets = "  - version: 1.2.3\n    os: linux\n    arch: x86_64\n    url: http://127.0.0.1/asset\n    sha256: {digest}\n";
-    run_case(correct_assets, Some("auto".into()), true);
-    run_case(correct_assets, Some("b".repeat(64)), false);
+    let platform = neoenv_core::tools::Platform::host();
+    let correct_assets = format!(
+        "  - version: 1.2.3\n    os: {}\n    arch: {}\n    url: http://127.0.0.1/asset\n    sha256: {{digest}}\n",
+        platform.os, platform.arch
+    );
+    run_case(&correct_assets, Some("auto".into()), true, 2);
+    run_case(&correct_assets, Some("b".repeat(64)), false, 1);
     let duplicate = format!("{correct_assets}{correct_assets}");
-    run_case(&duplicate, Some("auto".into()), false);
+    run_case(&duplicate, Some("auto".into()), false, 1);
 }
 
 /// Stops and joins a local fixture server on both normal return and unwind.
@@ -1754,17 +1762,20 @@ fn aqua_global_lock_reuse_requires_matching_manifest_pins() {
     let data_home = directory.path().join("data");
     let artifact = b"#!/bin/sh\nexit 0\n";
     let artifact_digest = format!("{:x}", Sha256::digest(artifact));
+    let platform = neoenv_core::tools::Platform::host();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let manifest = format!(
-        "package: owner/tool\nassets:\n  - version: 1.2.3\n    os: linux\n    arch: x86_64\n    url: http://{address}/asset\n    sha256: {artifact_digest}\n"
+        "package: owner/tool\nassets:\n  - version: 1.2.3\n    os: {}\n    arch: {}\n    url: http://{address}/asset\n    sha256: {artifact_digest}\n",
+        platform.os, platform.arch
     );
     let manifest_digest = format!("{:x}", Sha256::digest(manifest.as_bytes()));
     let bad_artifact = b"this digest is intentionally not the fixture artifact";
     let bad_artifact_digest = format!("{:x}", Sha256::digest(bad_artifact));
     let bad_manifest = format!(
-        "package: owner/tool\nassets:\n  - version: 1.2.3\n    os: linux\n    arch: x86_64\n    url: http://{address}/asset\n    sha256: {bad_artifact_digest}\n"
+        "package: owner/tool\nassets:\n  - version: 1.2.3\n    os: {}\n    arch: {}\n    url: http://{address}/asset\n    sha256: {bad_artifact_digest}\n",
+        platform.os, platform.arch
     );
     let bad_manifest_digest = format!("{:x}", Sha256::digest(bad_manifest.as_bytes()));
     let stop = Arc::new(AtomicBool::new(false));

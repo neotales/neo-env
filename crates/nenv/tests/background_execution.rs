@@ -621,9 +621,10 @@ fn execution_reports_platform_unavailability_without_running_the_task() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn jobs_report_platform_unavailability_without_running_steps() {
-    let root =
-        project("jobs: {unsupported: {steps: [{uses: shell, run: 'touch should-not-run'}]}}");
+fn background_job_steps_report_platform_unavailability_without_running() {
+    let root = project(
+        "jobs: {unsupported: {steps: [{uses: shell, background: true, run: 'touch should-not-run'}]}}",
+    );
     let output = run(&root, &["job", "run", "unsupported"]);
     assert!(!output.status.success(), "{output:?}");
     assert!(
@@ -632,6 +633,26 @@ fn jobs_report_platform_unavailability_without_running_steps() {
         "{output:?}"
     );
     assert!(!root.path().join("should-not-run").exists());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn foreground_jobs_remain_supported_without_graph_controls() {
+    let root = project("jobs: {foreground: {steps: [{uses: shell, run: 'touch foreground-ran'}]}}");
+    let output = run(&root, &["job", "run", "foreground"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        root.path().join("foreground-ran").exists(),
+        "foreground job step was not run: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("foreground:1 Succeeded"),
+        "{output:?}"
+    );
 }
 
 #[test]
@@ -700,18 +721,50 @@ fn job_dependency_and_wait_names_are_not_task_names_and_cycles_are_refused() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn unreachable_broken_jobs_do_not_poison_a_requested_job_graph() {
     let root = project(
         r"
 jobs:
   invalid: [no-such-task]
-  dependency: [{run: 'true'}]
+  dependency: [{run: 'touch dependency-ran'}]
   finish:
     needs: [dependency]
-    steps: [{run: 'true'}]
+    steps: [{run: 'touch finish-ran'}]
 ",
     );
-    success(&run(&root, &["job", "run", "finish"]));
+    let output = run(&root, &["job", "run", "finish"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.path().join("dependency-ran").exists(), "{output:?}");
+    assert!(root.path().join("finish-ran").exists(), "{output:?}");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn job_graphs_require_owned_background_execution_on_macos() {
+    let root = project(
+        r"
+jobs:
+  invalid: [no-such-task]
+  dependency: [{run: 'touch dependency-ran'}]
+  finish:
+    needs: [dependency]
+    steps: [{run: 'touch finish-ran'}]
+",
+    );
+    let output = run(&root, &["job", "run", "finish"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("exclusive child ownership is not implemented on this platform"),
+        "{output:?}"
+    );
+    assert!(!root.path().join("dependency-ran").exists());
+    assert!(!root.path().join("finish-ran").exists());
 }
 
 #[test]
