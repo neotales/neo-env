@@ -8,7 +8,7 @@
 use std::{
     fs,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener, ToSocketAddrs},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, ToSocketAddrs},
     path::PathBuf,
     process::{Command, Output},
     sync::{
@@ -35,10 +35,13 @@ enum Response {
 struct HttpsFixture {
     dir: TempDir,
     port: u16,
-    address: SocketAddr,
+    ipv4_address: SocketAddr,
+    loopback_addresses: Vec<SocketAddr>,
+    ipv6_available: bool,
     stop: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
     accepts: Arc<AtomicUsize>,
+    accepted_addresses: Arc<Mutex<Vec<SocketAddr>>>,
     tls_errors: Arc<Mutex<Vec<String>>>,
     server: Option<thread::JoinHandle<()>>,
     fixture_binary: PathBuf,
@@ -50,6 +53,45 @@ struct Binaries {
     release: PathBuf,
     _fixture_source: TempDir,
     _target: TempDir,
+}
+
+fn bind_loopback_listeners() -> (Vec<TcpListener>, Vec<SocketAddr>, bool) {
+    const PORT_ATTEMPTS: usize = 16;
+
+    for _ in 0..PORT_ATTEMPTS {
+        let ipv4 = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind IPv4 loopback fixture listener");
+        let ipv4_address = ipv4.local_addr().unwrap();
+        let ipv6_address = SocketAddrV6::new(Ipv6Addr::LOCALHOST, ipv4_address.port(), 0, 0);
+
+        let (mut listeners, mut addresses, ipv6_available) = match TcpListener::bind(ipv6_address) {
+            Ok(ipv6) => (
+                vec![ipv4, ipv6],
+                vec![ipv4_address, ipv6_address.into()],
+                true,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) if ipv6_is_unavailable(&error) => (vec![ipv4], vec![ipv4_address], false),
+            Err(error) => panic!("bind IPv6 loopback fixture listener: {error}"),
+        };
+
+        for listener in &mut listeners {
+            listener
+                .set_nonblocking(true)
+                .expect("set loopback fixture listener nonblocking");
+        }
+        addresses.sort();
+        return (listeners, addresses, ipv6_available);
+    }
+
+    panic!("could not reserve one port for both loopback address families");
+}
+
+fn ipv6_is_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+    ) || (cfg!(windows) && matches!(error.raw_os_error(), Some(10047 | 10049)))
 }
 
 /// Normalizes a temporary fixture file before applying LF-based test surgery.
@@ -205,35 +247,41 @@ impl HttpsFixture {
             .with_no_client_auth()
             .with_single_cert(vec![cert.der().clone()], private.into())
             .unwrap();
-        // Match the address family selected for `localhost`; Windows may
-        // prefer IPv6 while a v4-only listener would only accept 127.0.0.1.
-        let listener = ("localhost", 0)
-            .to_socket_addrs()
-            .unwrap()
-            .find_map(|address| TcpListener::bind(address).ok())
-            .expect("bind a localhost address");
-        let address = listener.local_addr().unwrap();
-        let port = address.port();
-        listener.set_nonblocking(true).unwrap();
+        // Bind both loopback families to one port so a separately resolved
+        // `localhost` connection cannot land on an unrelated service.
+        let (listeners, loopback_addresses, ipv6_available) = bind_loopback_listeners();
+        let ipv4_address = loopback_addresses
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .expect("IPv4 loopback listener is required");
+        let port = ipv4_address.port();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let requests = Arc::new(AtomicUsize::new(0));
         let server_requests = Arc::clone(&requests);
         let accepts = Arc::new(AtomicUsize::new(0));
         let server_accepts = Arc::clone(&accepts);
+        let accepted_addresses = Arc::new(Mutex::new(Vec::new()));
+        let server_accepted_addresses = Arc::clone(&accepted_addresses);
         let tls_errors = Arc::new(Mutex::new(Vec::new()));
         let server_errors = Arc::clone(&tls_errors);
         let server = thread::spawn(move || {
             let mut clients = Vec::new();
             while !stopped.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        server_accepts.fetch_add(1, Ordering::Relaxed);
-                        let tls = Arc::new(tls.clone());
-                        let response = response.clone();
-                        let requests = Arc::clone(&server_requests);
-                        let errors = Arc::clone(&server_errors);
-                        clients.push(thread::spawn(move || {
+                for listener in &listeners {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            server_accepts.fetch_add(1, Ordering::Relaxed);
+                            server_accepted_addresses
+                                .lock()
+                                .unwrap()
+                                .push(listener.local_addr().unwrap());
+                            let tls = Arc::new(tls.clone());
+                            let response = response.clone();
+                            let requests = Arc::clone(&server_requests);
+                            let errors = Arc::clone(&server_errors);
+                            clients.push(thread::spawn(move || {
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                             let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                             let connection = rustls::ServerConnection::new(tls).unwrap();
@@ -279,13 +327,13 @@ impl HttpsFixture {
                                     thread::sleep(Duration::from_secs(3));
                                 }
                             }
-                        }));
+                            }));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("HTTPS accept: {error}"),
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("HTTPS accept: {error}"),
                 }
+                thread::sleep(Duration::from_millis(10));
             }
             for client in clients {
                 client.join().unwrap();
@@ -294,10 +342,13 @@ impl HttpsFixture {
         Self {
             dir,
             port,
-            address,
+            ipv4_address,
+            loopback_addresses,
+            ipv6_available,
             stop,
             requests,
             accepts,
+            accepted_addresses,
             tls_errors,
             server: Some(server),
             fixture_binary: binaries.fixture.clone(),
@@ -334,6 +385,62 @@ impl HttpsFixture {
 
     fn run(&self, project: &TempDir, args: &[&str]) -> Output {
         self.command(project).args(args).output().unwrap()
+    }
+
+    fn assert_loopback_endpoint_families(&self) {
+        assert!(self.ipv4_address.is_ipv4());
+        assert!(self.loopback_addresses.contains(&self.ipv4_address));
+        assert_eq!(
+            self.loopback_addresses.iter().any(SocketAddr::is_ipv6),
+            self.ipv6_available,
+            "IPv6 listener availability must match the recorded fixture state"
+        );
+        assert!(
+            self.loopback_addresses
+                .iter()
+                .all(|address| address.port() == self.port && address.ip().is_loopback()),
+            "fixture listeners must be loopback-only and share one port: {:?}",
+            self.loopback_addresses
+        );
+
+        let resolved = ("localhost", self.port)
+            .to_socket_addrs()
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert!(!resolved.is_empty(), "localhost resolved to no endpoints");
+        assert!(
+            resolved.iter().all(|address| {
+                address.ip().is_loopback()
+                    && (self.loopback_addresses.contains(address)
+                        || (!self.ipv6_available && address.is_ipv6()))
+            }),
+            "localhost resolved outside the fixture's available loopback families: {resolved:?}"
+        );
+
+        for address in &self.loopback_addresses {
+            let stream = std::net::TcpStream::connect_timeout(address, Duration::from_secs(2))
+                .unwrap_or_else(|error| {
+                    panic!("fixture endpoint {address} did not accept TCP: {error}")
+                });
+            drop(stream);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let accepted = self.accepted_addresses.lock().unwrap().clone();
+            if self
+                .loopback_addresses
+                .iter()
+                .all(|address| accepted.contains(address))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not accept on every bound endpoint: {accepted:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn assert_tls_alert(&self, expected: &str) {
@@ -536,7 +643,7 @@ fn production_tls_verifier_rejects_hostname_mismatch_with_fixture_anchor(binarie
         .with_no_client_auth();
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_owned()).unwrap();
     let connection = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
-    let stream = std::net::TcpStream::connect(server.address).unwrap();
+    let stream = std::net::TcpStream::connect(server.ipv4_address).unwrap();
     let mut tls = rustls::StreamOwned::new(connection, stream);
     let result = tls
         .write_all(b"GET / HTTP/1.0\r\n\r\n")
@@ -563,11 +670,7 @@ fn production_tls_verifier_rejects_hostname_mismatch_with_fixture_anchor(binarie
     let accepts_before_cli = server.accepts.load(Ordering::Relaxed);
     // The certificate names localhost, not the loopback IP. The fixture build
     // injects the trusted root but uses the same rustls verifier as production.
-    let host = match server.address.ip() {
-        std::net::IpAddr::V4(address) => address.to_string(),
-        std::net::IpAddr::V6(address) => format!("[{address}]"),
-    };
-    let spec = server.spec(&digest).replacen("localhost", &host, 1);
+    let spec = server.spec(&digest).replacen("localhost", "127.0.0.1", 1);
     let output = server
         .command(&project)
         .args(["remote", "fetch", &spec])
@@ -636,6 +739,8 @@ fn controlled_direct_file_https_lifecycle() {
     // Stack ownership removes both nested Cargo output and copied source on
     // success or panic, without touching any other run's target.
     let binaries = binaries();
+    let endpoint_fixture = HttpsFixture::new(Response::Body(Vec::new()), &binaries);
+    endpoint_fixture.assert_loopback_endpoint_families();
     https_fetch_then_approval_and_execution_for_module_and_package(&binaries);
     https_fetch_rejects_mismatch_oversize_stall_and_redirect_before_publish(&binaries);
     https_fetch_rejects_untrusted_server_certificate(&binaries);
