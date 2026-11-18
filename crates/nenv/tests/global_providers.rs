@@ -1608,7 +1608,8 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
         manifest_assets: &str,
         pinned_digest: Option<String>,
         expected_success: bool,
-        expected_requests: usize,
+        expected_paths: &[String],
+        expected_error: Option<&str>,
     ) {
         let directory = TempDir::new().unwrap();
         let config_home = directory.path().join("config");
@@ -1626,8 +1627,8 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server_thread = thread::spawn(move || {
-            let mut served = 0;
-            while served < expected_requests && !server_stop.load(Ordering::Acquire) {
+            let mut paths = Vec::new();
+            while !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         if stream
@@ -1648,6 +1649,7 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
                             .and_then(|line| line.split_whitespace().nth(1))
                             .unwrap_or("/")
                             .to_owned();
+                        paths.push(path.clone());
                         let body = if path.ends_with("/registry.yaml") {
                             manifest.as_bytes().to_vec()
                         } else {
@@ -1659,8 +1661,7 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
                             body.len()
                         )
                         .unwrap();
-                        stream.write_all(&body).unwrap();
-                        served += 1;
+                        let _ = stream.write_all(&body);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -1668,7 +1669,7 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
                     Err(error) => panic!("Aqua input fixture listener failed: {error}"),
                 }
             }
-            served
+            paths
         });
         let mut server = FixtureServer::new(stop, server_thread);
         let mut command = global_command(directory.path(), &config_home, &data_home);
@@ -1688,10 +1689,10 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
             command.env("NEOENV_GLOBAL_AQUA_MANIFEST_SHA256", digest);
         }
         let output = command.output().unwrap();
-        let served = server.stop();
+        let paths = server.stop();
         assert_eq!(
-            served, expected_requests,
-            "Aqua fixture request count for expected success={expected_success}"
+            paths, expected_paths,
+            "Aqua fixture paths for expected success={expected_success}"
         );
         assert_eq!(
             output.status.success(),
@@ -1699,6 +1700,17 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if let Some(expected_error) = expected_error {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(expected_error),
+                "expected diagnostic {expected_error:?}, got {stderr}"
+            );
+            assert!(
+                !paths.iter().any(|path| path == "/asset"),
+                "negative case unexpectedly requested its artifact: {paths:?}"
+            );
+        }
         if expected_success {
             let config = fs::read_to_string(global_config_path(&config_home)).unwrap();
             assert!(config.contains(&manifest_digest));
@@ -1710,14 +1722,34 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
     }
 
     let platform = neoenv_core::tools::Platform::host();
+    let manifest_path =
+        format!("/0123456789012345678901234567890123456789/pkgs/owner/tool/registry.yaml");
     let correct_assets = format!(
         "  - version: 1.2.3\n    os: {}\n    arch: {}\n    url: http://127.0.0.1/asset\n    sha256: {{digest}}\n",
         platform.os, platform.arch
     );
-    run_case(&correct_assets, Some("auto".into()), true, 2);
-    run_case(&correct_assets, Some("b".repeat(64)), false, 1);
+    run_case(
+        &correct_assets,
+        Some("auto".into()),
+        true,
+        &[manifest_path.clone(), "/asset".into()],
+        None,
+    );
+    run_case(
+        &correct_assets,
+        Some("b".repeat(64)),
+        false,
+        &[manifest_path.clone()],
+        Some("has an unpinned Aqua registry"),
+    );
     let duplicate = format!("{correct_assets}{correct_assets}");
-    run_case(&duplicate, Some("auto".into()), false, 1);
+    run_case(
+        &duplicate,
+        Some("auto".into()),
+        false,
+        &[manifest_path],
+        Some("has ambiguous registry assets"),
+    );
 }
 
 /// Stops and joins a local fixture server on both normal return and unwind.

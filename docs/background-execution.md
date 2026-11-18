@@ -6,13 +6,13 @@ On macOS, foreground tasks continue to use the historical adapter, but owned
 background tasks and background job steps are unavailable and fail with an
 explicit diagnostic before starting commands. Sequential jobs without graph
 controls remain supported as foreground step sequences; job DAG/graph execution
-requires owned background workers and is unavailable on macOS. Runtime library
-callers default to no backend and reject overlap before effects; no library API
-changes process-global signal policy. On Linux, shell pipelines can run under
-the owned supervisor, which owns and cleans up their process group. Portable
-command-chain forms whose stages cannot be supervised fail closed when
-background execution is requested. Dry-run validates and plans without
-starting a helper.
+requires owned background workers and is unavailable on macOS, as do
+job-level timeouts. Runtime library callers default to no backend and reject
+overlap before effects; no library API changes process-global signal policy.
+On Linux, shell pipelines can run under the owned supervisor, which owns and
+cleans up their process group. Portable command-chain forms whose stages cannot
+be supervised fail closed when background execution is requested. Dry-run
+validates and plans without starting a helper.
 
 Tasks and job steps run in their existing dependency/declaration order unless
 overlap is requested. These controls are structured concurrency, not exact
@@ -24,10 +24,11 @@ compatibility profiles; the line-oriented environment format is unchanged.
 Where owned background execution is available, job definitions are DAG nodes:
 independent jobs are launched concurrently by default, and each job joins its
 declared `needs` before its own steps begin. Job step sequences remain ordered.
-Sequential foreground jobs remain available on macOS, but DAG jobs and
-`background: true` steps require the owned backend there and are refused before
-commands start. The job-level `background` key is rejected because job-level
-concurrency is already the default for DAG execution.
+Sequential foreground jobs remain available on macOS, but DAG jobs,
+job-level `timeout`, and `background: true` steps require the owned backend
+there and are refused before commands start. The job-level `background` key is
+rejected because job-level concurrency is already the default for DAG
+execution.
 
 ```yaml
 tasks:
