@@ -10,7 +10,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sha2::{Digest as _, Sha256};
@@ -1008,50 +1008,64 @@ struct LocalGitFixture {
     package_sha256: String,
 }
 
-// Approximate the production stages on failure, with bounded direct children.
-// Report only fixed classifications; never print Git's path-bearing stderr.
+// Null output prevents descendants holding pipes or producing unbounded logs.
+// Only the direct child is killed on timeout; Git descendants are not managed
+// by this approximate diagnostic and may outlive it.
+fn bounded_status(command: &mut Command, timeout: Duration) -> String {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return "spawn-error".into(),
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.to_string(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return if result.is_err() {
+                    "wait-error"
+                } else {
+                    "timeout"
+                }
+                .into();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostic_child_timeout_is_bounded() {
+    let start = Instant::now();
+    let status = bounded_status(
+        Command::new("sh").args(["-c", "exec sleep 30"]),
+        Duration::from_millis(100),
+    );
+    assert_eq!(status, "timeout");
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+// Approximation only: same Git stages and deep staging layout, with fixed
+// status labels, but not the runtime's process-tree containment.
 fn diagnose_local_git(local: &LocalGitFixture) -> String {
-    let origin = neoenv_runtime::remote::RemoteModule::parse(&local.spec).unwrap();
-    let path = origin.local_path().unwrap();
+    let module = neoenv_runtime::remote::RemoteModule::parse(&local.spec).unwrap();
+    let path = module.local_path().unwrap();
     #[cfg(windows)]
     let path = path.replace('/', "\\");
-    let mut reports = Vec::new();
-    // Mirror the production depth and staging layout: Git for Windows may
-    // reject a deep worktree even when a shallow temporary repository works.
-    let parent = local
-        .cached
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
+    let parent = local.cached.ancestors().nth(5).unwrap();
     fs::create_dir_all(parent).unwrap();
-    let staged = tempfile::Builder::new()
+    let stage = tempfile::Builder::new()
         .prefix("neoenv-module-")
         .tempdir_in(parent)
         .unwrap();
-    let target = staged.path().join("source");
-    let options = [
-        "-c",
-        "protocol.allow=never",
-        "-c",
-        "protocol.file.allow=always",
-        "-c",
-        "protocol.https.allow=never",
-        "-c",
-        "protocol.ssh.allow=never",
-        "-c",
-        "protocol.git.allow=never",
-        "-c",
-        "protocol.ext.allow=never",
-        "-c",
-        "core.hooksPath=/dev/null",
-    ];
+    let target = stage.path().join("source");
     let reference = local
         .spec
         .rsplit_once('@')
@@ -1060,119 +1074,59 @@ fn diagnose_local_git(local: &LocalGitFixture) -> String {
         .split("//")
         .next()
         .unwrap();
-    for stage in ["init", "fetch", "rev-parse", "checkout"] {
-        let mut command = Command::new("git");
-        // Production permits file transport only during fetch.
-        let mut stage_options = options;
-        if stage != "fetch" {
-            stage_options[3] = "protocol.file.allow=never";
-        }
-        command.args(stage_options);
-        if stage == "init" {
-            command.arg("init").arg(&target);
+    let mut reports = Vec::new();
+    for name in ["init", "fetch", "rev-parse", "checkout"] {
+        let mut cmd = Command::new("git");
+        cmd.args([
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            if name == "fetch" {
+                "protocol.file.allow=always"
+            } else {
+                "protocol.file.allow=never"
+            },
+            "-c",
+            "protocol.https.allow=never",
+            "-c",
+            "protocol.ssh.allow=never",
+            "-c",
+            "protocol.git.allow=never",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ]);
+        if name == "init" {
+            cmd.arg("init").arg(&target);
         } else {
-            command.arg("-C").arg(&target);
-            match stage {
+            cmd.arg("-C").arg(&target);
+            match name {
                 "fetch" => {
-                    command.args(["fetch", "--depth=1", "--no-tags", path.as_ref(), reference]);
+                    cmd.args(["fetch", "--depth=1", "--no-tags", path.as_ref(), reference]);
                 }
                 "rev-parse" => {
-                    command.args(["rev-parse", "FETCH_HEAD^{commit}"]);
+                    cmd.args(["rev-parse", "FETCH_HEAD^{commit}"]);
                 }
                 "checkout" => {
-                    // This fixture pins a full commit; production checks out
-                    // the peeled result after confirming it equals that commit.
-                    command.args(["checkout", "--detach", "--force", reference]);
+                    cmd.args(["checkout", "--detach", "--force", reference]);
                 }
                 _ => unreachable!(),
             }
         }
-        command
-            .env("GIT_CONFIG_NOSYSTEM", "1")
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_COUNT", "0")
             .env_remove("GIT_CONFIG_PARAMETERS")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_NO_REPLACE_OBJECTS", "1");
-        let (status, stderr) = bounded_diagnostic_command(&mut command, Duration::from_secs(10));
-        let stderr = stderr.to_ascii_lowercase();
-        let labels = [
-            ("config", "config"),
-            ("null", "/dev/null"),
-            ("protocol", "protocol"),
-            ("repository", "repository"),
-            ("not_found", "no such file"),
-            ("access", "permission denied"),
-            ("ownership", "dubious ownership"),
-            ("invalid_argument", "invalid argument"),
-            ("not_git", "not a git repository"),
-            (
-                "not_git_repository",
-                "does not appear to be a git repository",
-            ),
-            ("revision", "couldn't find remote ref"),
-            ("long_path", "filename too long"),
-            ("create_file", "unable to create file"),
-            ("invalid_path", "invalid path"),
-        ]
-        .iter()
-        .filter_map(|(label, needle)| stderr.contains(needle).then_some(*label))
-        .collect::<Vec<_>>();
-        reports.push(format!("{stage} status={status} classes={labels:?}"));
+        reports.push(format!(
+            "{name}={}",
+            bounded_status(&mut cmd, Duration::from_secs(10))
+        ));
     }
-    format!("approximate probe: {}", reports.join("; "))
-}
-
-// Files rather than pipes ensure a descendant cannot hold a reader open after
-// the owned direct child is terminated. The deadline also covers startup.
-fn bounded_diagnostic_command(command: &mut Command, timeout: Duration) -> (String, String) {
-    use std::io::{Read, Seek};
-    use std::process::Stdio;
-    use std::time::Instant;
-
-    let mut stderr = tempfile::tempfile().unwrap();
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr.try_clone().unwrap()));
-    let start = Instant::now();
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => return ("spawn-error".into(), String::new()),
-    };
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.to_string(),
-            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break "timeout".into();
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break "wait-error".into();
-            }
-        }
-    };
-    let mut text = String::new();
-    let _ = stderr.rewind();
-    let _ = stderr.take(64 * 1024).read_to_string(&mut text);
-    (status, text)
-}
-
-#[cfg(unix)]
-#[test]
-fn diagnostic_child_timeout_is_bounded() {
-    let start = std::time::Instant::now();
-    let (status, _) = bounded_diagnostic_command(
-        Command::new("sh").args(["-c", "exec sleep 30"]),
-        Duration::from_millis(100),
-    );
-    assert_eq!(status, "timeout");
-    assert!(start.elapsed() < Duration::from_secs(5));
+    reports.join(" ")
 }
 
 fn local_git_fixture() -> LocalGitFixture {
@@ -1274,7 +1228,7 @@ fn a_local_git_task_package_fetches_then_needs_execution_trust() {
         .unwrap();
     assert!(
         fetched.status.success(),
-        "a rewritten local path must not be followed: {fetched:?}; diagnostic: {}",
+        "a rewritten local path must not be followed: {fetched:?}; approximate stages: {}",
         if fetched.status.success() {
             String::new()
         } else {

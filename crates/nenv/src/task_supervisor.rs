@@ -688,84 +688,100 @@ impl Drop for OwnedChild {
 mod tests {
     use super::*;
 
-    #[test]
-    fn waitable_child_and_group_cleanup_work_on_host() {
-        const CHILD_FLAG: &str = "NEOENV_SUPERVISOR_WAITID_PROBE";
-        if std::env::var_os(CHILD_FLAG).is_none() {
-            let mut stderr = tempfile::tempfile().unwrap();
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "task_supervisor::tests::waitable_child_and_group_cleanup_work_on_host",
-                    "--nocapture",
-                ])
-                .env(CHILD_FLAG, "1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(stderr.try_clone().unwrap()))
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) => {}
-                    Err(_) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        panic!("isolated waitid probe wait failed");
-                    }
+    fn bounded_status(command: &mut Command, timeout: Duration) -> Option<ExitStatus> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().ok()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
                 }
-                if Instant::now() >= deadline {
+                _ => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!("isolated waitid probe timed out");
+                    return None;
                 }
-                std::thread::sleep(Duration::from_millis(10));
-            };
-            use std::io::Seek;
-            stderr.rewind().unwrap();
-            let mut text = String::new();
-            let _ = stderr.take(64 * 1024).read_to_string(&mut text);
-            let class = if text.contains("waitid probe deadline") {
-                "deadline"
-            } else if text.contains("waitid probe") {
-                "waitid"
-            } else if text.contains("owned group cleanup probe") {
-                "cleanup"
-            } else {
-                "other"
-            };
-            assert!(status.success(), "isolated waitid probe failed: {class}");
+            }
+        }
+    }
+
+    #[test]
+    fn supervisor_probe_timeout_is_bounded() {
+        let start = Instant::now();
+        assert!(
+            bounded_status(
+                Command::new("sh").args(["-c", "exec sleep 30"]),
+                Duration::from_millis(100)
+            )
+            .is_none()
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn waitable_child_and_group_cleanup_work_on_host() {
+        const FLAG: &str = "NEOENV_SUPERVISOR_WAITID_PROBE";
+        if std::env::var_os(FLAG).is_none() {
+            // Only this direct probe child is terminated on deadline. Its
+            // short-lived "exit 7" child is never signalled by numeric PID here.
+            let status = bounded_status(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "task_supervisor::tests::waitable_child_and_group_cleanup_work_on_host",
+                    ])
+                    .env(FLAG, "1"),
+                Duration::from_secs(10),
+            );
+            assert!(
+                status.is_some_and(|status| status.success()),
+                "supervisor primitive probe status: {status:?}; 21=handler, 22=spawn, 23=waitid, 24=cleanup, 25=deadline, 26=status"
+            );
             return;
         }
-
         let flag = Arc::new(AtomicBool::new(false));
-        signal_hook::flag::register(signal_hook::consts::SIGCHLD, flag).unwrap();
-        let process = Command::new("sh")
+        if signal_hook::flag::register(signal_hook::consts::SIGCHLD, flag).is_err() {
+            std::process::exit(21);
+        }
+        let Ok(process) = Command::new("sh")
             .args(["-c", "exit 7"])
             .process_group(0)
             .spawn()
-            .unwrap();
+        else {
+            std::process::exit(22);
+        };
         let mut owned = OwnedChild(Some(process));
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let observed = waitid(
+            let observed = match waitid(
                 WaitId::Pid(ChildPid::from_child(owned.0.as_ref().unwrap())),
                 WaitIdOptions::EXITED
                     | WaitIdOptions::STOPPED
                     | WaitIdOptions::NOHANG
                     | WaitIdOptions::NOWAIT,
-            )
-            .expect("waitid probe");
+            ) {
+                Ok(observed) => observed,
+                Err(_) => std::process::exit(23),
+            };
             if let Some(status) = observed
                 && (status.exited() || status.killed() || status.dumped())
             {
-                let status = owned.stop().expect("owned group cleanup probe");
-                assert_eq!(status.into_raw(), 1792);
+                let Ok(status) = owned.stop() else {
+                    std::process::exit(24)
+                };
+                if status.into_raw() != 1792 {
+                    std::process::exit(26)
+                }
                 break;
             }
-            assert!(Instant::now() < deadline, "waitid probe deadline");
+            if Instant::now() >= deadline {
+                std::process::exit(25)
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
