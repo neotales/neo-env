@@ -473,12 +473,15 @@ jobs:
     timeout: 2s
     steps:
       - uses: shell
-        run: "touch started; sh -c '(sleep 4; touch escaped) & exit 0' | cat"
+        run: "sh -c '(touch descendant-ready; sleep 4; touch escaped) & exit 0' | cat"
 "#,
     );
     let output = run(&root, &["job", "run", "build"]);
     assert!(!output.status.success());
-    assert!(root.path().join("started").exists(), "{output:?}");
+    assert!(
+        root.path().join("descendant-ready").exists(),
+        "descendant did not signal readiness: {output:?}"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("build:1 TimedOut") || stdout.contains("build TimedOut"),

@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -1318,21 +1318,29 @@ struct GithubFixture {
 fn request_headers(stream: &mut impl Read) -> Option<Vec<u8>> {
     let mut request = [0_u8; 4096];
     let mut size = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
     // A TCP read is not an HTTP request. Consume the headers before routing or
     // closing, including fragmented writes, without allowing unbounded input.
     while size < request.len() && !request[..size].windows(4).any(|end| end == b"\r\n\r\n") {
+        if Instant::now() >= deadline {
+            return None;
+        }
         match stream.read(&mut request[size..]) {
             Ok(0) => return None,
             Ok(read) => size += read,
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
                 ) =>
             {
-                thread::yield_now();
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(2));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return None,
             Err(_) => return None,
         }
     }
@@ -1376,7 +1384,15 @@ impl GithubFixture {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         server_requests.fetch_add(1, Ordering::Relaxed);
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        if stream
+                            .set_read_timeout(Some(Duration::from_millis(100)))
+                            .is_err()
+                            || stream
+                                .set_write_timeout(Some(Duration::from_secs(2)))
+                                .is_err()
+                        {
+                            continue;
+                        }
                         let Some(request) = request_headers(&mut stream) else {
                             continue;
                         };
@@ -1595,6 +1611,7 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
         let artifact = b"#!/bin/sh\nexit 0\n";
         let artifact_digest = format!("{:x}", Sha256::digest(artifact));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let manifest_assets = manifest_assets
             .replace("http://127.0.0.1/asset", &format!("http://{address}/asset"))
@@ -1602,32 +1619,53 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
         let manifest = format!("package: owner/tool\nassets:\n{manifest_assets}");
         let manifest_digest = format!("{:x}", Sha256::digest(manifest.as_bytes()));
         let expected_requests = usize::from(expected) + 1;
-        let server = thread::spawn(move || {
-            for _ in 0..expected_requests {
-                let (mut stream, _) = listener.accept().unwrap();
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                let request = request_headers(&mut stream).unwrap();
-                let path = String::from_utf8_lossy(&request)
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap()
-                    .to_owned();
-                let body = if path.ends_with("/registry.yaml") {
-                    manifest.as_bytes().to_vec()
-                } else {
-                    artifact.to_vec()
-                };
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .unwrap();
-                stream.write_all(&body).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server_thread = thread::spawn(move || {
+            let mut served = 0;
+            while served < expected_requests && !server_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .is_err()
+                            || stream
+                                .set_write_timeout(Some(Duration::from_secs(2)))
+                                .is_err()
+                        {
+                            continue;
+                        }
+                        let Some(request) = request_headers(&mut stream) else {
+                            continue;
+                        };
+                        let path = String::from_utf8_lossy(&request)
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_owned();
+                        let body = if path.ends_with("/registry.yaml") {
+                            manifest.as_bytes().to_vec()
+                        } else {
+                            artifact.to_vec()
+                        };
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
+                        stream.write_all(&body).unwrap();
+                        served += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("Aqua input fixture listener failed: {error}"),
+                }
             }
         });
+        let mut server = FixtureServer::new(stop, server_thread);
         let mut command = global_command(directory.path(), &config_home, &data_home);
         command.args(["use", "--user", "aqua:owner/tool@1.2.3"]);
         command
@@ -1645,7 +1683,7 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
             command.env("NEOENV_GLOBAL_AQUA_MANIFEST_SHA256", digest);
         }
         let output = command.output().unwrap();
-        server.join().unwrap();
+        server.stop();
         assert_eq!(
             output.status.success(),
             expected,
@@ -1732,8 +1770,15 @@ fn aqua_global_lock_reuse_requires_matching_manifest_pins() {
         while !server_stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                    if stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .is_err()
+                        || stream
+                            .set_write_timeout(Some(Duration::from_secs(2)))
+                            .is_err()
+                    {
+                        continue;
+                    }
                     let Some(request) = request_headers(&mut stream) else {
                         continue;
                     };

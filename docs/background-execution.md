@@ -6,9 +6,10 @@ On macOS, foreground tasks continue to use the historical adapter, but owned
 background tasks and jobs are unavailable and fail with an explicit diagnostic
 before starting commands. Runtime library callers default to no backend and
 reject overlap before effects; no library API changes process-global signal
-policy. Pipelines/portable command chains fail closed in background mode until
-per-stage supervision is implemented. Dry-run validates and plans without
-starting a helper.
+policy. On Linux, shell pipelines can run under the owned supervisor, which
+owns and cleans up their process group. Portable command-chain forms whose
+stages cannot be supervised fail closed when background execution is requested.
+Dry-run validates and plans without starting a helper.
 
 Tasks and job steps run in their existing dependency/declaration order unless
 overlap is requested. These controls are structured concurrency, not exact
