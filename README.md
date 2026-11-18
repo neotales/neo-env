@@ -26,8 +26,9 @@ Linux, macOS, and Windows on amd64 and arm64. Windows arm64 uses the `windows-11
 successful run uploads a platform-specific archive (`nenv-<os>-<arch>.tar.gz` on Unix and `.zip` on
 Windows); Windows archives include both `nenv.exe` and its `neoenv-windows-launcher.exe` helper.
 The workspace test step sets `RUST_TEST_THREADS=1` to mitigate observed timing-sensitive parallel
-test failures; it runs the full suite and skips no tests. This is a mitigation, not a fix for the
-parallel test instability.
+test failures. It runs Cargo's default workspace test selection: tests marked `#[ignore]` and
+feature-gated test targets are excluded unless explicitly enabled. This is a mitigation, not a fix
+for the parallel test instability.
 Pull requests and branch builds retain these as workflow artifacts. An annotated `v*` tag pointing
 at the exact workflow revision publishes the same archives to a GitHub Release. Lightweight tags
 and tags not pointing to the checked-out revision are rejected. No release is created from a branch
