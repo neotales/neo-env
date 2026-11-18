@@ -1,8 +1,9 @@
-name: CI
+name: CI and release artifacts
 
 on:
   push:
     branches: [dev]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -14,9 +15,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
-    name: Rust CI
-    runs-on: ubuntu-24.04
+  build:
+    name: Build and test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            format: tar.gz
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            format: tar.gz
+          - name: macos-amd64
+            runner: macos-15-large
+            target: x86_64-apple-darwin
+            format: tar.gz
+          - name: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            format: tar.gz
+          - name: windows-amd64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            format: zip
+          - name: windows-arm64
+            runner: windows-2025
+            target: aarch64-pc-windows-msvc
+            format: zip
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - name: Check out source
@@ -28,11 +57,77 @@ jobs:
           toolchain: 1.98.1
           components: rustfmt, clippy
 
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Build
-        run: cargo build -p nenv --locked
-
       - name: Test
         run: cargo test --workspace --locked
+
+      - name: Build release executables
+        run: cargo build --release --locked --target ${{ matrix.target }} -p nenv ${{ runner.os == 'Windows' && '-p neoenv-windows-job' || '' }}
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/nenv" dist/nenv
+          tar -C dist -czf "nenv-${{ matrix.name }}.tar.gz" nenv
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/nenv.exe" dist/nenv.exe
+          Copy-Item "target/${{ matrix.target }}/release/neoenv-windows-launcher.exe" dist/neoenv-windows-launcher.exe
+          Compress-Archive -Path dist/* -DestinationPath "nenv-${{ matrix.name }}.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18e5 # v4.6.2
+        with:
+          name: nenv-${{ matrix.name }}
+          path: nenv-${{ matrix.name }}.${{ matrix.format }}
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish annotated tag assets
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out exact tagged revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Require annotated tag pointing to workflow revision
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          REVISION: ${{ github.sha }}
+        run: |
+          test "$(git cat-file -t "refs/tags/$TAG")" = tag
+          test "$(git rev-parse "$TAG^{commit}")" = "$REVISION"
+
+      - name: Download all platform archives
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: dist
+          pattern: nenv-*
+          merge-multiple: true
+
+      - name: Create or update release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --generate-notes
+          gh release upload "$TAG" dist/* --clobber
