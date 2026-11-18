@@ -193,7 +193,11 @@ fn binaries() -> Binaries {
         let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
         let request = builder.tls_config(Arc::new(config)).build().get(url);
 "#;
-    fs::write(&transport, contents.replacen(marker, injection, 1)).unwrap();
+    let contents = contents.replacen(marker, injection, 1);
+    let marker = ".map_err(|error| HttpError::request(target, error))";
+    let diagnostic = ".map_err(|error| { eprintln!(\"fixture transport error: {error:?}\"); HttpError::request(target, error) })";
+    assert_eq!(contents.matches(marker).count(), 1);
+    fs::write(&transport, contents.replacen(marker, diagnostic, 1)).unwrap();
     let target_root = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace.join("target"));
@@ -496,7 +500,13 @@ fn https_fetch_then_approval_and_execution_for_module_and_package(binaries: &Bin
         };
         fs::write(project.path().join("neoenv.yaml"), config).unwrap();
         let fetch = server.run(&project, &["remote", "fetch", &spec]);
-        assert!(fetch.status.success(), "fetch: {fetch:?}");
+        assert!(
+            fetch.status.success(),
+            "fetch: {fetch:?}; accepts: {}; requests: {}; server TLS errors: {:?}",
+            server.accepts.load(Ordering::Relaxed),
+            server.requests.load(Ordering::Relaxed),
+            server.tls_errors.lock().unwrap()
+        );
         assert!(
             server
                 .run(&project, &["trust", "add", "--project", "neoenv.yaml"])
