@@ -8,7 +8,7 @@
 use std::{
     fs,
     io::{Read, Write},
-    net::TcpListener,
+    net::{SocketAddr, TcpListener, ToSocketAddrs},
     path::PathBuf,
     process::{Command, Output},
     sync::{
@@ -35,6 +35,7 @@ enum Response {
 struct HttpsFixture {
     dir: TempDir,
     port: u16,
+    address: SocketAddr,
     stop: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
     accepts: Arc<AtomicUsize>,
@@ -204,8 +205,15 @@ impl HttpsFixture {
             .with_no_client_auth()
             .with_single_cert(vec![cert.der().clone()], private.into())
             .unwrap();
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
+        // Match the address family selected for `localhost`; Windows may
+        // prefer IPv6 while a v4-only listener would only accept 127.0.0.1.
+        let listener = ("localhost", 0)
+            .to_socket_addrs()
+            .unwrap()
+            .find_map(|address| TcpListener::bind(address).ok())
+            .expect("bind a localhost address");
+        let address = listener.local_addr().unwrap();
+        let port = address.port();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
@@ -286,6 +294,7 @@ impl HttpsFixture {
         Self {
             dir,
             port,
+            address,
             stop,
             requests,
             accepts,
@@ -527,7 +536,7 @@ fn production_tls_verifier_rejects_hostname_mismatch_with_fixture_anchor(binarie
         .with_no_client_auth();
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_owned()).unwrap();
     let connection = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
-    let stream = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let stream = std::net::TcpStream::connect(server.address).unwrap();
     let mut tls = rustls::StreamOwned::new(connection, stream);
     let result = tls
         .write_all(b"GET / HTTP/1.0\r\n\r\n")
@@ -554,7 +563,11 @@ fn production_tls_verifier_rejects_hostname_mismatch_with_fixture_anchor(binarie
     let accepts_before_cli = server.accepts.load(Ordering::Relaxed);
     // The certificate names localhost, not the loopback IP. The fixture build
     // injects the trusted root but uses the same rustls verifier as production.
-    let spec = server.spec(&digest).replacen("localhost", "127.0.0.1", 1);
+    let host = match server.address.ip() {
+        std::net::IpAddr::V4(address) => address.to_string(),
+        std::net::IpAddr::V6(address) => format!("[{address}]"),
+    };
+    let spec = server.spec(&digest).replacen("localhost", &host, 1);
     let output = server
         .command(&project)
         .args(["remote", "fetch", &spec])
