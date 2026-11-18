@@ -94,6 +94,19 @@ fn ipv6_is_unavailable(error: &std::io::Error) -> bool {
     ) || (cfg!(windows) && matches!(error.raw_os_error(), Some(10047 | 10049)))
 }
 
+fn localhost_addresses_match_fixture(
+    resolved: &[SocketAddr],
+    bound: &[SocketAddr],
+    ipv6_available: bool,
+) -> bool {
+    !resolved.is_empty()
+        && resolved.iter().all(|address| {
+            address.ip().is_loopback()
+                && (bound.contains(address) || (!ipv6_available && address.is_ipv6()))
+        })
+        && resolved.iter().any(|address| bound.contains(address))
+}
+
 /// Normalizes a temporary fixture file before applying LF-based test surgery.
 fn replace_fixture_marker(contents: &str, marker: &str, replacement: &str) -> String {
     let contents = contents.replace("\r\n", "\n");
@@ -409,11 +422,11 @@ impl HttpsFixture {
             .collect::<Vec<_>>();
         assert!(!resolved.is_empty(), "localhost resolved to no endpoints");
         assert!(
-            resolved.iter().all(|address| {
-                address.ip().is_loopback()
-                    && (self.loopback_addresses.contains(address)
-                        || (!self.ipv6_available && address.is_ipv6()))
-            }),
+            localhost_addresses_match_fixture(
+                &resolved,
+                &self.loopback_addresses,
+                self.ipv6_available
+            ),
             "localhost resolved outside the fixture's available loopback families: {resolved:?}"
         );
 
@@ -732,6 +745,37 @@ fn fixture_marker_replacement_handles_lf_and_crlf_inputs() {
         let changed = add_fixture_lock_dependency(&input);
         assert!(changed.contains("\n \"rustix\",\n \"rustls\",\n"));
     }
+}
+
+#[test]
+fn localhost_resolution_requires_a_bound_family_when_ipv6_is_unavailable() {
+    let bound = [SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443))];
+    let only_v6 = [SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::LOCALHOST,
+        443,
+        0,
+        0,
+    ))];
+
+    assert!(
+        !localhost_addresses_match_fixture(&only_v6, &bound, false),
+        "an IPv6-only localhost result cannot match an IPv4-only fixture"
+    );
+    assert!(
+        localhost_addresses_match_fixture(
+            &[
+                only_v6[0],
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443)),
+            ],
+            &bound,
+            false,
+        ),
+        "an unavailable IPv6 result may coexist with a usable bound IPv4 result"
+    );
+    assert!(
+        !localhost_addresses_match_fixture(&only_v6, &bound, true),
+        "an available but unbound IPv6 result must be rejected"
+    );
 }
 
 #[test]

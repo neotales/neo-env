@@ -1049,10 +1049,15 @@ fn installed_cargo_tool_is_selected_by_project_which_use_and_exec() {
         .join(neoenv_installer::tools::install_key(&shared_tool).unwrap());
     assert!(shared_root.exists());
     let mut obsolete_tool = current_tool.clone();
-    obsolete_tool.cargo_toolchain = Some(format!("{compiler_version}-aarch64-unknown-linux-gnu"));
+    let obsolete_toolchain = format!("{}-obsolete-fixture", current_build.toolchain);
+    obsolete_tool.cargo_toolchain = Some(obsolete_toolchain.clone());
     let mut obsolete_build = current_build;
-    obsolete_build.toolchain = obsolete_tool.cargo_toolchain.clone().unwrap();
+    obsolete_build.toolchain = obsolete_toolchain;
     let obsolete_key = neoenv_installer::tools::install_key(&obsolete_tool).unwrap();
+    assert_ne!(
+        obsolete_key, current_key,
+        "obsolete Cargo toolchain fixture must not alias the current install"
+    );
     let obsolete_root = storage.install_directory().join(&obsolete_key);
     fs::create_dir_all(obsolete_root.join("bin")).unwrap();
     fs::copy(
