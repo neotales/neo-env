@@ -10,6 +10,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    time::Duration,
 };
 
 use sha2::{Digest as _, Sha256};
@@ -1007,7 +1008,7 @@ struct LocalGitFixture {
     package_sha256: String,
 }
 
-// On fixture failure, probe Git with the production protocol restrictions.
+// Approximate the production stages on failure, with bounded direct children.
 // Report only fixed classifications; never print Git's path-bearing stderr.
 fn diagnose_local_git(local: &LocalGitFixture) -> String {
     let origin = neoenv_runtime::remote::RemoteModule::parse(&local.spec).unwrap();
@@ -1061,7 +1062,12 @@ fn diagnose_local_git(local: &LocalGitFixture) -> String {
         .unwrap();
     for stage in ["init", "fetch", "rev-parse", "checkout"] {
         let mut command = Command::new("git");
-        command.args(options);
+        // Production permits file transport only during fetch.
+        let mut stage_options = options;
+        if stage != "fetch" {
+            stage_options[3] = "protocol.file.allow=never";
+        }
+        command.args(stage_options);
         if stage == "init" {
             command.arg("init").arg(&target);
         } else {
@@ -1074,22 +1080,23 @@ fn diagnose_local_git(local: &LocalGitFixture) -> String {
                     command.args(["rev-parse", "FETCH_HEAD^{commit}"]);
                 }
                 "checkout" => {
+                    // This fixture pins a full commit; production checks out
+                    // the peeled result after confirming it equals that commit.
                     command.args(["checkout", "--detach", "--force", reference]);
                 }
                 _ => unreachable!(),
             }
         }
-        let output = command
+        command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_COUNT", "0")
             .env_remove("GIT_CONFIG_PARAMETERS")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+            .env("GIT_NO_REPLACE_OBJECTS", "1");
+        let (status, stderr) = bounded_diagnostic_command(&mut command, Duration::from_secs(10));
+        let stderr = stderr.to_ascii_lowercase();
         let labels = [
             ("config", "config"),
             ("null", "/dev/null"),
@@ -1112,12 +1119,60 @@ fn diagnose_local_git(local: &LocalGitFixture) -> String {
         .iter()
         .filter_map(|(label, needle)| stderr.contains(needle).then_some(*label))
         .collect::<Vec<_>>();
-        reports.push(format!(
-            "{stage} status={} classes={labels:?}",
-            output.status
-        ));
+        reports.push(format!("{stage} status={status} classes={labels:?}"));
     }
-    reports.join("; ")
+    format!("approximate probe: {}", reports.join("; "))
+}
+
+// Files rather than pipes ensure a descendant cannot hold a reader open after
+// the owned direct child is terminated. The deadline also covers startup.
+fn bounded_diagnostic_command(command: &mut Command, timeout: Duration) -> (String, String) {
+    use std::io::{Read, Seek};
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut stderr = tempfile::tempfile().unwrap();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr.try_clone().unwrap()));
+    let start = Instant::now();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return ("spawn-error".into(), String::new()),
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.to_string(),
+            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break "timeout".into();
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break "wait-error".into();
+            }
+        }
+    };
+    let mut text = String::new();
+    let _ = stderr.rewind();
+    let _ = stderr.take(64 * 1024).read_to_string(&mut text);
+    (status, text)
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostic_child_timeout_is_bounded() {
+    let start = std::time::Instant::now();
+    let (status, _) = bounded_diagnostic_command(
+        Command::new("sh").args(["-c", "exec sleep 30"]),
+        Duration::from_millis(100),
+    );
+    assert_eq!(status, "timeout");
+    assert!(start.elapsed() < Duration::from_secs(5));
 }
 
 fn local_git_fixture() -> LocalGitFixture {

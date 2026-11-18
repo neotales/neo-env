@@ -692,20 +692,51 @@ mod tests {
     fn waitable_child_and_group_cleanup_work_on_host() {
         const CHILD_FLAG: &str = "NEOENV_SUPERVISOR_WAITID_PROBE";
         if std::env::var_os(CHILD_FLAG).is_none() {
-            let output = Command::new(std::env::current_exe().unwrap())
+            let mut stderr = tempfile::tempfile().unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "task_supervisor::tests::waitable_child_and_group_cleanup_work_on_host",
                     "--nocapture",
                 ])
                 .env(CHILD_FLAG, "1")
-                .output()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(stderr.try_clone().unwrap()))
+                .spawn()
                 .unwrap();
-            assert!(
-                output.status.success(),
-                "isolated waitid probe: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {}
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("isolated waitid probe wait failed");
+                    }
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated waitid probe timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            use std::io::Seek;
+            stderr.rewind().unwrap();
+            let mut text = String::new();
+            let _ = stderr.take(64 * 1024).read_to_string(&mut text);
+            let class = if text.contains("waitid probe deadline") {
+                "deadline"
+            } else if text.contains("waitid probe") {
+                "waitid"
+            } else if text.contains("owned group cleanup probe") {
+                "cleanup"
+            } else {
+                "other"
+            };
+            assert!(status.success(), "isolated waitid probe failed: {class}");
             return;
         }
 
