@@ -1,7 +1,10 @@
 # Background work, barriers, and parallel dependencies
 
-Unix `nenv` CLI background and parallel actions run through its private
-single-command supervisor. Runtime library callers default to no backend and
+Platform support is narrower than the Unix family. On Linux, `nenv` CLI
+background task execution and job scheduling use the private owned supervisor.
+On macOS, foreground tasks continue to use the historical adapter, but owned
+background tasks and jobs are unavailable and fail with an explicit diagnostic
+before starting commands. Runtime library callers default to no backend and
 reject overlap before effects; no library API changes process-global signal
 policy. Pipelines/portable command chains fail closed in background mode until
 per-stage supervision is implemented. Dry-run validates and plans without
@@ -80,7 +83,7 @@ Caller cancellation reaches all workers and their running descendants; returning
 from a run joins all workers, including on preparation errors. Cancellation does
 not roll back files, network effects, or other work already completed.
 
-The intended Unix background implementation owns process groups. Its descendants are stopped even
+The Linux background implementation owns process groups. Its descendants are stopped even
 when the group leader exits successfully. Background stdin is closed; it cannot
 race foreground work for interactive input. Intentionally escaping containment
 (for example, creating a new session) is outside this mechanism; trusted commands

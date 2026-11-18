@@ -69,14 +69,15 @@ fn approve(root: &std::path::Path) {
 
 fn run(root: &tempfile::TempDir, args: &[&str]) -> Output {
     approve(root.path());
+    let temp_dir = fs::canonicalize(root.path()).unwrap().join("tmp");
+    fs::create_dir_all(&temp_dir).unwrap();
     Command::new(env!("CARGO_BIN_EXE_nenv"))
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap())
         .env("HOME", root.path().join("home"))
-        .env(
-            "TMPDIR",
-            std::env::var_os("TMPDIR").unwrap_or_else(|| std::env::temp_dir().into_os_string()),
-        )
+        .env("TMPDIR", &temp_dir)
+        .env("TMP", &temp_dir)
+        .env("TEMP", &temp_dir)
         .env("NEOENV_CONFIG_HOME", root.path().join("config"))
         .env("NEOENV_DATA_HOME", root.path().join("data"))
         .env("NEOENV_STATE_HOME", root.path().join("state"))
@@ -469,14 +470,21 @@ fn foreground_timeout_stops_descendant_holding_pipeline_open() {
         r#"
 jobs:
   build:
-    timeout: 150ms
+    timeout: 2s
     steps:
-      - run: "sh -c '(sleep 1; touch escaped) & exit 0' | cat"
+      - uses: shell
+        run: "touch started; sh -c '(sleep 4; touch escaped) & exit 0' | cat"
 "#,
     );
     let output = run(&root, &["job", "run", "build"]);
     assert!(!output.status.success());
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert!(root.path().join("started").exists(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("build:1 TimedOut") || stdout.contains("build TimedOut"),
+        "{stdout}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(4300));
     assert!(!root.path().join("escaped").exists());
 }
 

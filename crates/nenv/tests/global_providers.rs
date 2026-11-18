@@ -1327,13 +1327,12 @@ fn request_headers(stream: &mut impl Read) -> Option<Vec<u8>> {
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::Interrupted
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
                 ) =>
             {
                 thread::yield_now();
             }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return None,
             Err(_) => return None,
         }
     }
@@ -1606,6 +1605,8 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
         let server = thread::spawn(move || {
             for _ in 0..expected_requests {
                 let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                 let request = request_headers(&mut stream).unwrap();
                 let path = String::from_utf8_lossy(&request)
                     .lines()
@@ -1668,6 +1669,38 @@ fn aqua_global_use_requires_and_verifies_pinned_manifest_inputs() {
     run_case(&duplicate, Some("auto".into()), false);
 }
 
+/// Stops and joins a local fixture server on both normal return and unwind.
+struct FixtureServer {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl FixtureServer {
+    fn new(stop: Arc<AtomicBool>, thread: thread::JoinHandle<()>) -> Self {
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("fixture server thread");
+        }
+    }
+}
+
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            // Preserve the original assertion panic during unwinding.
+            let _ = thread.join();
+        }
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn aqua_global_lock_reuse_requires_matching_manifest_pins() {
@@ -1695,16 +1728,20 @@ fn aqua_global_lock_reuse_requires_matching_manifest_pins() {
     let server_fail_install = Arc::clone(&fail_install);
     let requests = Arc::new(AtomicUsize::new(0));
     let server_requests = Arc::clone(&requests);
-    let server = thread::spawn(move || {
+    let server_thread = thread::spawn(move || {
         while !server_stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let request = request_headers(&mut stream).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                    let Some(request) = request_headers(&mut stream) else {
+                        continue;
+                    };
                     let path = String::from_utf8_lossy(&request)
                         .lines()
                         .next()
                         .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap()
+                        .unwrap_or("/")
                         .to_owned();
                     let body = if path.ends_with("/registry.yaml") {
                         if server_fail_install.load(Ordering::Acquire) {
@@ -1715,14 +1752,16 @@ fn aqua_global_lock_reuse_requires_matching_manifest_pins() {
                     } else {
                         artifact
                     };
-                    write!(
+                    if write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     )
-                    .unwrap();
-                    stream.write_all(body).unwrap();
-                    server_requests.fetch_add(1, Ordering::AcqRel);
+                    .is_ok()
+                        && stream.write_all(body).is_ok()
+                    {
+                        server_requests.fetch_add(1, Ordering::AcqRel);
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
@@ -1731,6 +1770,7 @@ fn aqua_global_lock_reuse_requires_matching_manifest_pins() {
             }
         }
     });
+    let mut server = FixtureServer::new(Arc::clone(&stop), server_thread);
     let invoke = |revision: &str, digest: &str| {
         global_command(directory.path(), &config_home, &data_home)
             .args(["use", "--user", "aqua:owner/tool@1.2.3"])
@@ -1800,8 +1840,7 @@ fn aqua_global_lock_reuse_requires_matching_manifest_pins() {
         before_old_request,
         "the previous selected tool should remain available from its lock"
     );
-    stop.store(true, Ordering::Release);
-    server.join().unwrap();
+    server.stop();
     let lock_path = fs::read_dir(lock_root)
         .unwrap()
         .map(|entry| entry.unwrap().path())
