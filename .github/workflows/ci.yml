@@ -30,7 +30,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             format: tar.gz
           - name: macos-amd64
-            runner: macos-15-large
+            runner: macos-15-intel
             target: x86_64-apple-darwin
             format: tar.gz
           - name: macos-arm64
@@ -42,7 +42,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             format: zip
           - name: windows-arm64
-            runner: windows-2025
+            runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             format: zip
     runs-on: ${{ matrix.runner }}
@@ -65,6 +65,8 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+        env:
+          RUST_TEST_THREADS: "1"
 
       - name: Build release executables
         run: cargo build --release --locked --target ${{ matrix.target }} -p nenv ${{ runner.os == 'Windows' && '-p neoenv-windows-job' || '' }}
@@ -75,6 +77,7 @@ jobs:
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/nenv" dist/nenv
+          dist/nenv --version
           tar -C dist -czf "nenv-${{ matrix.name }}.tar.gz" nenv
 
       - name: Package Windows archive
@@ -84,10 +87,14 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/nenv.exe" dist/nenv.exe
           Copy-Item "target/${{ matrix.target }}/release/neoenv-windows-launcher.exe" dist/neoenv-windows-launcher.exe
+          & dist/nenv.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "Packaged nenv smoke test failed: $LASTEXITCODE" }
+          & dist/neoenv-windows-launcher.exe
+          if ($LASTEXITCODE -ne 1) { throw "Packaged launcher smoke test did not reach its expected invalid-arguments exit: $LASTEXITCODE" }
           Compress-Archive -Path dist/* -DestinationPath "nenv-${{ matrix.name }}.zip"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18e5 # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nenv-${{ matrix.name }}
           path: nenv-${{ matrix.name }}.${{ matrix.format }}
