@@ -1,0 +1,4 @@
+format_version: 1
+env:
+  APP_NAME: neoenv
+  LOG_LEVEL: debug

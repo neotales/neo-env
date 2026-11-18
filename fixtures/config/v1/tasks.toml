@@ -1,0 +1,30 @@
+context = "staging"
+
+[tasks]
+lint = "cargo clippy"
+
+[tasks.base]
+template = true
+description = "Shared build settings."
+
+[tasks.base.inputs]
+release = "boolean"
+
+[tasks.build]
+extends = "base"
+uses = "shell"
+run = "cargo build"
+help = "Build the application."
+
+[tasks."build:staging"]
+extends = "build"
+run = "cargo build --release"
+
+[tasks.test]
+run = "cargo test"
+needs = "build"
+
+[tasks.test.inputs.suite]
+type = "string"
+required = true
+description = "Test suite name."

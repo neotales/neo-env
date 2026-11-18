@@ -1,0 +1,6 @@
+dotenv = [{ path = "environment-extensions.env" }]
+path = [{ prepend = "bin" }, { append = "tools/bin" }]
+
+[env]
+BASE = "fixture"
+MESSAGE = "${BASE}-message"

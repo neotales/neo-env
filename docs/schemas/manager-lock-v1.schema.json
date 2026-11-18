@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neotales.github.io/neoenv/manager-lock-v1.schema.json",
+  "title": "NeoEnv package manager lock graph v1",
+  "description": "Nested manager_lock object. Its schema_version evolves independently from the enclosing neoenv lockfile schema. JSON Schema cannot express the complete graph contract: ManagerLock::validate is the source of truth for unique package IDs, dependency references, and at most 1,000,000 dependency edges total. Dependency cycles are allowed; consumers must use bounded cycle-safe traversal.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "manager",
+    "manager_version",
+    "manager_sha256",
+    "runtime_version",
+    "manifest_sha256",
+    "lockfile_sha256",
+    "script_policy",
+    "packages"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "manager": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "manager_version": { "type": "string", "minLength": 1, "maxLength": 16384 },
+    "manager_sha256": { "$ref": "#/$defs/sha256" },
+    "runtime_version": { "type": "string", "minLength": 1, "maxLength": 16384 },
+    "runtime_archive": {
+      "type": "object",
+      "description": "Required for verified managed-runtime replay; absent on older manager locks.",
+      "additionalProperties": false,
+      "required": ["url", "sha256"],
+      "properties": {
+        "url": { "type": "string", "format": "uri", "maxLength": 16384 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "lockfile_sha256": { "$ref": "#/$defs/sha256" },
+    "script_policy": {
+      "const": "disabled",
+      "description": "Consumers MUST configure package installation to disable lifecycle scripts; recording the value alone is not enforcement."
+    },
+    "packages": {
+      "type": "array",
+      "maxItems": 100000,
+      "description": "Runtime validation additionally enforces unique id values across these objects and that every dependency names one of those IDs. The runtime validator also caps the sum of dependency array lengths at 1,000,000. These cross-record constraints are not guaranteed by this JSON Schema.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "version", "dependencies", "tarball_url", "integrity", "sha256"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 16384 },
+          "name": { "type": "string", "minLength": 1, "maxLength": 16384 },
+          "version": { "type": "string", "minLength": 1, "maxLength": 16384 },
+          "dependencies": { "type": "array", "maxItems": 100000, "uniqueItems": true, "items": { "type": "string" } },
+          "tarball_url": { "type": "string", "format": "uri", "maxLength": 16384 },
+          "integrity": { "type": "string", "maxLength": 256, "description": "Whitespace-separated npm SRI alternatives. Like the npm verifier, malformed/unsupported alternatives are ignored; at least one sha256 or sha512 token with correctly sized base64 digest is required by validation. Install verification accepts if any supported digest matches." },
+          "sha256": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

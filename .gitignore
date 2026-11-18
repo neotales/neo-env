@@ -1,0 +1,41 @@
+# Build output.
+/target/
+
+# Local overrides. `.env` usually holds secrets, but this project treats
+# configuration as data and reads `.env` files as a documented feature, so a
+# `.env` in a fixture tree is not automatically a secret. The rules are narrow on
+# purpose: only the paths that hold real values are ignored, and
+# `fixtures/**/*.env` is explicitly un-ignored below because the tests write and
+# read them.
+.env
+.env.*
+!.env.example
+!**/fixtures/**/*.env
+
+# Editor and OS noise.
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Test and coverage output.
+*.profraw
+*.profdata
+coverage/
+lcov.info
+
+# Release staging. Packaging writes here before a release is cut, and nothing in
+# it should ever be committed.
+/dist/
+/release/
+
+# Temporary fixtures a test forgot to clean up.
+.nenv-tmp/
+
+# `Cargo.lock` is committed. This repository ships a binary, so a release that
+# resolves differently from the one that was tested is the failure that rule
+# rules out. Do not add it here.

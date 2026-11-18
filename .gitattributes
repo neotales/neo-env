@@ -1,0 +1,33 @@
+# Normalise line endings on checkin, and keep the executable bit on the scripts
+# that need it.
+#
+# `* text=auto` alone is not enough. A shell script that arrives with CRLF line
+# endings fails on Linux with an error that names `/bin/sh^M` rather than the line
+# ending, and a release gate that only ever runs on Windows cannot catch it. This
+# is the setting that makes the failure impossible rather than unlikely.
+
+* text=auto
+
+*.rs   text
+*.toml text
+*.json text
+*.md   text
+*.yml  text
+*.yaml text
+*.ts   text
+*.sh   text eol=lf
+*.ps1  text eol=crlf
+
+# The fixture corpus is JSON and TOML with deliberate trailing-newline and
+# whitespace shapes. Some of these files test a parser against a value with no
+# final newline, and normalising it would make the test pass for the wrong
+# reason. Marked binary so git leaves every byte alone.
+fixtures/**/*.json -text
+fixtures/**/*.toml -text
+fixtures/**/.neoenv   -text
+fixtures/**/*.env     -text
+
+# Vendored third-party digests and test vectors are bytes.
+*.kdbx binary
+*.der  binary
+*.age  binary

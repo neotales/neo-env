@@ -1,0 +1,7 @@
+tools:
+  - id: future-tool
+    version: 1.0.0
+    provider: github-release
+    url: https://example.test/future-tool.tar.gz
+    sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    binaries: [future-tool]

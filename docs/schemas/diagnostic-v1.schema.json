@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neotales.github.io/neoenv/diagnostic-v1.schema.json",
+  "title": "NeoEnv diagnostic document v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "diagnostic"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["category", "code", "message"],
+      "properties": {
+        "category": { "enum": ["usage", "validation", "not_found", "trust", "runtime", "internal"] },
+        "code": { "type": "string", "pattern": "^NEO[0-9]{3}$" },
+        "message": { "type": "string" },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "line", "column"],
+          "properties": {
+            "path": { "type": "string" },
+            "line": { "type": "integer", "minimum": 1 },
+            "column": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    }
+  }
+}

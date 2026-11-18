@@ -1,0 +1,24 @@
+context: staging
+tasks:
+  lint: cargo clippy
+  base:
+    template: true
+    description: Shared build settings.
+    inputs:
+      release: boolean
+  build:
+    extends: base
+    uses: shell
+    run: cargo build
+    help: Build the application.
+  "build:staging":
+    extends: build
+    run: cargo build --release
+  test:
+    run: cargo test
+    needs: build
+    inputs:
+      suite:
+        type: string
+        required: true
+        description: Test suite name.

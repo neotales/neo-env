@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neotales.github.io/neoenv/validation-v1.schema.json",
+  "title": "NeoEnv validation document v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "valid", "sources"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "valid": { "const": true },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "kind"],
+        "properties": {
+          "path": { "type": "string" },
+          "kind": { "type": "string" }
+        }
+      }
+    }
+  }
+}

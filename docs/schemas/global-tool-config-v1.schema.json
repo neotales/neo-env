@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neotales.example/neoenv/schemas/global-tool-config-v1.schema.json",
+  "title": "nenv global tool configuration",
+  "description": "The configured tool selections in one scope. This document does not report installed state; it is deliberately distinct from the project tool-state document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "contract", "scope", "configured_tools", "installed_state_included"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract": { "const": "global-tool-config" },
+    "scope": { "enum": ["user", "system"] },
+    "configured_tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "configured_version"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "configured_version": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "installed_state_included": { "const": false }
+  }
+}

@@ -1,0 +1,25 @@
+format_version = 1
+context = "development"
+path = [{ prepend = "tools/bin" }, { append = "scripts" }]
+
+[env]
+PROJECT_NAME = "neoenv-sample"
+LOG_LEVEL = "debug"
+GREETING = "Hello from ${PROJECT_NAME}"
+
+[tasks.base]
+template = true
+description = "Shared metadata for sample tasks."
+
+[tasks.check]
+extends = "base"
+uses = "portable"
+run = "echo ${GREETING}"
+help = "Render the configured greeting."
+
+[tasks.build]
+extends = "base"
+uses = "portable"
+run = "echo Building ${PROJECT_NAME}"
+needs = ["check"]
+help = "Plan a portable build command after the check task."

@@ -1,0 +1,3 @@
+# Compact environment-only configuration.
+APP_NAME=neoenv
+LOG_LEVEL="debug"

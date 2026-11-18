@@ -1,0 +1,3 @@
+imports: [base.toml]
+env:
+  MODULE_VALUE: feature

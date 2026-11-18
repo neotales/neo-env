@@ -1,0 +1,22 @@
+tasks:
+  base:
+    template: true
+    if: env.ENABLED
+    force: false
+  inherited:
+    extends: base
+    uses: portable
+    run: "true"
+  skip:
+    uses: portable
+    run: "true"
+    if: false
+  forced:
+    uses: portable
+    run: "true"
+    if: false
+    force: true
+  platform:
+    uses: portable
+    run: "true"
+    if: os == "linux" || arch == "x86_64"

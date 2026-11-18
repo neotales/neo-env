@@ -1,0 +1,4 @@
+imports: [feature.yaml]
+env:
+  MODULE_VALUE: project
+  SHELL_VALUE: "a'not-executed"

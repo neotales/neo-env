@@ -1,0 +1,15 @@
+# The toolchain every build in this repository uses.
+#
+# It sits at the repository root, and that is load-bearing: rustup finds a
+# toolchain file by walking up from the current directory, so a copy inside a
+# crate directory would win for a command run there and be ignored for one run
+# from the root. The channel here, `rust-version` in `Cargo.toml`, and what the
+# vendored crates declare are three numbers that have to agree.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+
+[env]
+# Incremental caches are the largest thing in `target/` and there is nothing to
+# gain from them when most builds are clean builds.
+CARGO_INCREMENTAL = "0"

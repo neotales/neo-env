@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neotales.github.io/neoenv/inspection-v1.schema.json",
+  "title": "NeoEnv inspection document v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "format_version", "sources", "environment", "path"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "format_version": { "const": 1 },
+    "sources": { "$ref": "#/$defs/sources" },
+    "environment": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "value", "redacted", "source"],
+        "properties": {
+          "key": { "type": "string" },
+          "value": { "type": "string" },
+          "redacted": { "type": "boolean" },
+          "source": { "$ref": "#/$defs/source_span" }
+        }
+      }
+    },
+    "path": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation", "value", "source"],
+        "properties": {
+          "operation": { "enum": ["prepend", "append"] },
+          "value": { "type": "string" },
+          "source": { "$ref": "#/$defs/source_span" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "kind"],
+        "properties": {
+          "path": { "type": "string" },
+          "kind": { "type": "string" }
+        }
+      }
+    },
+    "source_span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "line", "column"],
+      "properties": {
+        "path": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 },
+        "column": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+# `.neoenv` is the compact environment-only v1 format.
+MESSAGE="hello\nworld"
+CONTINUED=one\
+two
+LITERAL='not an escape: \n'

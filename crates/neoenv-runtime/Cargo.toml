@@ -1,0 +1,93 @@
+[package]
+name = "neoenv-runtime"
+publish = false
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+neotales-ssh = { path = "../neotales-ssh", version = "0.0.0-alpha.2" }
+indexmap.workspace = true
+flate2.workspace = true
+fs4.workspace = true
+getrandom.workspace = true
+neoenv-config.workspace = true
+neoenv-core.workspace = true
+neotales-dotenv.workspace = true
+neotales-env.workspace = true
+neotales-age.workspace = true
+neotales-keepass.workspace = true
+neotales-gotmpl.workspace = true
+neotales-process.workspace = true
+neoenv-policy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+# Git object ids are SHA-1. This crate resolves against the 0.10 line it was
+# written for; the workspace entry is the 0.11 line the vendored keepass and ssh
+# crates use, and the two are not interchangeable.
+sha1 = "0.10"
+sha2.workspace = true
+tempfile.workspace = true
+tar.workspace = true
+toml.workspace = true
+ureq.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[[bench]]
+name = "neoenv_resolution"
+harness = false
+
+[[test]]
+name = "background_tasks"
+harness = false
+path = "tests/background_tasks_main.rs"
+
+[target.'cfg(windows)'.dependencies]
+neoenv-windows-job = { path = "../neoenv-windows-job" }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["signal", "process", "term"] }
+signal-hook = "=0.3.18"
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs", "user"] }
+ring = "=0.17.14"
+rustix = { version = "=1.1.6", features = ["net", "process"] }
+
+# The operating-system credential store is a platform adapter. The features are
+# target-specific on purpose: a Linux build must not link the macOS Keychain
+# framework, and a Windows build must not require DBus. On a target with no
+# adapter the provider is unavailable rather than silently falling back.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.6", features = ["event", "net", "process"] }
+keyring = { version = "3.6.3", default-features = false, features = [
+  "async-io",
+  "async-secret-service",
+  "crypto-rust",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = [
+  "apple-native",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = [
+  "windows-native",
+] }
+
+[dev-dependencies]
+log = "0.4"

@@ -1,0 +1,20 @@
+[tasks.base]
+template = true
+if = "env.ENABLED"
+force = "false"
+
+[tasks.inherited]
+extends = "base"
+uses = "portable"
+run = "true"
+
+[tasks.skip]
+uses = "portable"
+run = "true"
+if = "false"
+
+[tasks.forced]
+uses = "portable"
+run = "true"
+if = "false"
+force = "true"

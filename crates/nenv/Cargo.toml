@@ -1,0 +1,72 @@
+[package]
+name = "nenv"
+publish = false
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Project-scoped developer environment manager"
+
+[features]
+# Opt-in process-lifecycle scenarios. Keep them outside the normal E2E suite
+# because they intentionally wait for real task deadlines and descendants.
+long-running-tests = []
+ssh-container-tests = []
+
+[[test]]
+name = "ssh_container"
+path = "tests/ssh_container.rs"
+required-features = ["ssh-container-tests"]
+
+[[test]]
+name = "long_running_cli"
+path = "tests/long_running_cli.rs"
+required-features = ["long-running-tests"]
+
+[dependencies]
+blake3.workspace = true
+ctrlc.workspace = true
+indexmap.workspace = true
+neoenv-config.workspace = true
+neoenv-core.workspace = true
+neoenv-installer.workspace = true
+neoenv-policy.workspace = true
+neoenv-runtime.workspace = true
+neotales-env.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal", "process", "term"] }
+ring = "=0.17.14"
+rustix = { version = "=1.1.6", features = ["process", "net"] }
+signal-hook = "=0.3.18"
+
+[dev-dependencies]
+base64.workspace = true
+flate2.workspace = true
+tar.workspace = true
+toml.workspace = true
+zip.workspace = true
+neotales-age.workspace = true
+neotales-keepass.workspace = true
+testcontainers.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+getrandom.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+nix.workspace = true
+rustix = { version = "=1.1.6", features = ["process"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

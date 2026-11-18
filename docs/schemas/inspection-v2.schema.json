@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neotales.github.io/neoenv/inspection-v2.schema.json",
+  "title": "NeoEnv inspection document v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "format_version", "sources", "environment", "path", "tasks"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "format_version": { "const": 1 },
+    "sources": { "$ref": "#/$defs/sources" },
+    "environment": { "type": "array" },
+    "path": { "type": "array" },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "id", "name", "slug", "description", "outputs"],
+        "properties": {
+          "key": { "type": "string" },
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "slug": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+          "description": { "type": ["string", "null"] },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "description", "visibility"],
+              "properties": {
+                "name": { "type": "string" },
+                "description": { "type": ["string", "null"] },
+                "visibility": { "enum": ["public", "private"] }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "kind"],
+        "properties": {
+          "path": { "type": "string" },
+          "kind": { "type": "string" }
+        }
+      }
+    }
+  }
+}

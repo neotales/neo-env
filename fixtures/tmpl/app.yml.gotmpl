@@ -1,0 +1,5 @@
+service: ${SERVICE}
+replicas: {{ index .Data "replicas" }}
+name: {{ .data.name }}
+os: {{ .OS }}
+arch: {{ .arch }}
