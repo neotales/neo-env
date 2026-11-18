@@ -73,6 +73,10 @@ fn run(root: &tempfile::TempDir, args: &[&str]) -> Output {
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap())
         .env("HOME", root.path().join("home"))
+        .env(
+            "TMPDIR",
+            std::env::var_os("TMPDIR").unwrap_or_else(|| std::env::temp_dir().into_os_string()),
+        )
         .env("NEOENV_CONFIG_HOME", root.path().join("config"))
         .env("NEOENV_DATA_HOME", root.path().join("data"))
         .env("NEOENV_STATE_HOME", root.path().join("state"))
@@ -459,6 +463,7 @@ tasks:
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn foreground_timeout_stops_descendant_holding_pipeline_open() {
     let root = project(
         r#"
@@ -604,6 +609,22 @@ fn execution_reports_platform_unavailability_without_running_the_task() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn jobs_report_platform_unavailability_without_running_steps() {
+    let root =
+        project("jobs: {unsupported: {steps: [{uses: shell, run: 'touch should-not-run'}]}}");
+    let output = run(&root, &["job", "run", "unsupported"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("exclusive child ownership is not implemented on this platform"),
+        "{output:?}"
+    );
+    assert!(!root.path().join("should-not-run").exists());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn jobs_have_an_overall_deadline_and_do_not_run_later_steps_after_it() {
     let root = project(
         r"
