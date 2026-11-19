@@ -88,6 +88,7 @@ fn send(
     socket.write_all(&bytes).unwrap();
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn versioned_socket_executes_single_owned_command() {
     let root = tempfile::tempdir().unwrap();
@@ -109,6 +110,25 @@ fn versioned_socket_executes_single_owned_command() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_execution_is_refused_before_any_side_effect() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut child, mut socket) = launch();
+    send(
+        &mut socket,
+        "sh",
+        &["-c", "printf yes > marker"],
+        root.path().to_str().unwrap(),
+        None,
+    );
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    assert_eq!(response, "ERROR\n");
+    assert!(!child.wait().unwrap().success());
+    assert!(!root.path().join("marker").exists());
+}
+
 #[test]
 fn incompatible_version_and_control_eof_are_refused() {
     let (mut child, mut socket) = launch();
@@ -123,6 +143,7 @@ fn incompatible_version_and_control_eof_are_refused() {
     assert!(!child.wait().unwrap().success());
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn timeout_kills_descendants_before_returning() {
     let root = tempfile::tempdir().unwrap();
@@ -142,6 +163,7 @@ fn timeout_kills_descendants_before_returning() {
     assert!(!root.path().join("escaped").exists());
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn eof_kills_a_started_command_and_its_descendants() {
     let root = tempfile::tempdir().unwrap();
@@ -169,6 +191,7 @@ fn eof_kills_a_started_command_and_its_descendants() {
     assert!(!root.path().join("escaped").exists());
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn exited_leader_does_not_leave_its_background_descendant() {
     let root = tempfile::tempdir().unwrap();
@@ -188,6 +211,7 @@ fn exited_leader_does_not_leave_its_background_descendant() {
     assert!(!root.path().join("escaped").exists());
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn inherited_ignored_sigchld_does_not_autoreap_owned_child() {
     let _ = binary_digest();
@@ -215,6 +239,7 @@ fn inherited_ignored_sigchld_does_not_autoreap_owned_child() {
     assert!(child.wait().unwrap().success());
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn broad_foreign_waiter_cannot_reap_supervisor_owned_command() {
     let root = tempfile::tempdir().unwrap();
@@ -270,6 +295,7 @@ assert response == b'STARTED\nEXIT 1792\n', response
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn startup_failure_is_reported_without_signalling_unrelated_child() {
     let root = tempfile::tempdir().unwrap();

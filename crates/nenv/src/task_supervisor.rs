@@ -141,6 +141,14 @@ fn serve(managed: bool) -> io::Result<()> {
     {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "binary version"));
     }
+    // Darwin cannot safely distinguish an unsignalable live process group
+    // from a zombie-only group when killpg returns EPERM. This private legacy
+    // mode must not launch anything until it can guarantee owned cleanup.
+    #[cfg(target_os = "macos")]
+    if !managed {
+        socket.write_all(b"ERROR\n")?;
+        return Err(io::Error::other("legacy supervisor unsupported on macOS"));
+    }
     let foreground_stdin = if request.foreground {
         let stdin = receive_stdin(&socket)?;
         Some(stdin)

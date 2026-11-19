@@ -69,11 +69,15 @@ jobs:
 
       - name: Diagnose Windows Git initialization
         if: runner.os == 'Windows'
-        run: cargo test --locked -p neoenv-runtime windows_git_init_compares_canonical_and_native_staging_paths -- --nocapture
+        run: cargo test --locked -p neoenv-runtime --lib windows_git_init_compares_canonical_and_native_staging_paths -- --nocapture
 
       - name: Verify Windows local Git fetch
         if: runner.os == 'Windows'
         run: cargo test --locked -p nenv --test execution_trust windows_public_local_git_fetch_uses_canonical_project_and_pins_checkout -- --nocapture
+
+      - name: Build Windows test launcher
+        if: runner.os == 'Windows'
+        run: cargo build --locked -p neoenv-windows-job --bin neoenv-windows-launcher
 
       - name: Test
         run: cargo test --workspace --locked
