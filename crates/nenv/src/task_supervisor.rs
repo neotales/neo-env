@@ -723,6 +723,15 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
+    fn errno_code(error: io::Error, base: i32) -> i32 {
+        base + match error.raw_os_error() {
+            Some(code) if code == Errno::EPERM as i32 => 1,
+            Some(code) if code == Errno::ESRCH as i32 => 2,
+            Some(code) if code == Errno::ECHILD as i32 => 3,
+            _ => 4,
+        }
+    }
+
     #[test]
     fn waitable_child_and_group_cleanup_work_on_host() {
         const FLAG: &str = "NEOENV_SUPERVISOR_WAITID_PROBE";
@@ -740,7 +749,7 @@ mod tests {
             );
             assert!(
                 status.is_some_and(|status| status.success()),
-                "supervisor primitive probe status: {status:?}; 21=handler, 22=spawn, 23=waitid, 24=cleanup, 25=deadline, 26=status"
+                "supervisor primitive probe status: {status:?}; 21=handler, 22=spawn, 23=waitid, 25=deadline, 26=status; 31-34=signal and 41-44=wait (1=EPERM, 2=ESRCH, 3=ECHILD, 4=other)"
             );
             return;
         }
@@ -771,9 +780,17 @@ mod tests {
             if let Some(status) = observed
                 && (status.exited() || status.killed() || status.dumped())
             {
-                let Ok(status) = owned.stop() else {
-                    std::process::exit(24)
-                };
+                // The leader is still an unreaped child, so its PID cannot
+                // have been reused when signalling its process group.
+                let mut child = owned.0.take().unwrap();
+                let id = i32::try_from(child.id()).unwrap();
+                let signal = kill(Pid::from_raw(-id), Signal::SIGKILL)
+                    .map_err(|error| errno_code(io::Error::from(error), 30));
+                let status = child.wait().map_err(|error| errno_code(error, 40));
+                if let Err(code) = signal {
+                    std::process::exit(code);
+                }
+                let status = status.unwrap_or_else(|code| std::process::exit(code));
                 if status.into_raw() != 1792 {
                     std::process::exit(26)
                 }
