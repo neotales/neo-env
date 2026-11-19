@@ -736,6 +736,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn waitable_child_and_group_cleanup_work_on_host() {
         const FLAG: &str = "NEOENV_SUPERVISOR_WAITID_PROBE";
@@ -935,6 +936,13 @@ mod tests {
             // descendant expires naturally; never retry using an unpinned PID.
             child.0.as_mut().unwrap().wait().unwrap();
             child.0.take();
+            if !with_descendant {
+                assert_eq!(
+                    signal,
+                    Err(Errno::EPERM),
+                    "Darwin zombie-only group signal behavior changed"
+                );
+            }
         }
     }
 }

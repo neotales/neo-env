@@ -41,6 +41,17 @@ pub(super) fn main() {
             "unavailable_backend_refuses_execution_but_dry_run_only_plans",
             unavailable_backend_refuses_execution_but_dry_run_only_plans,
         ),
+        #[cfg(target_os = "macos")]
+        (
+            "macos_explicit_owned_backend_refuses_before_effects",
+            macos_explicit_owned_backend_refuses_before_effects,
+        ),
+        #[cfg(target_os = "macos")]
+        (
+            "macos_explicit_backend_preserves_foreground_runners",
+            macos_explicit_backend_preserves_foreground_runners,
+        ),
+        #[cfg(target_os = "linux")]
         (
             "composite_steps_run_in_order_and_stop_after_failure",
             composite_steps_run_in_order_and_stop_after_failure,
@@ -77,34 +88,42 @@ pub(super) fn main() {
             "background_launch_overlaps_then_named_wait_publishes_outputs_and_environment",
             background_launch_overlaps_then_named_wait_publishes_outputs_and_environment,
         ),
+        #[cfg(target_os = "linux")]
         (
             "parallel_dependencies_really_overlap_and_are_joined_before_the_owner",
             parallel_dependencies_really_overlap_and_are_joined_before_the_owner,
         ),
+        #[cfg(target_os = "linux")]
         (
             "wait_all_is_a_barrier_and_successful_handoffs_merge_in_launch_order",
             wait_all_is_a_barrier_and_successful_handoffs_merge_in_launch_order,
         ),
+        #[cfg(target_os = "linux")]
         (
             "implicit_final_join_reports_background_failure_and_discards_its_handoff",
             implicit_final_join_reports_background_failure_and_discards_its_handoff,
         ),
+        #[cfg(target_os = "linux")]
         (
             "a_joined_failure_blocks_normal_work_but_allows_explicit_force_recovery",
             a_joined_failure_blocks_normal_work_but_allows_explicit_force_recovery,
         ),
+        #[cfg(target_os = "linux")]
         (
             "timeout_cleans_up_the_background_process_tree",
             timeout_cleans_up_the_background_process_tree,
         ),
+        #[cfg(target_os = "linux")]
         (
             "successful_background_leaders_cannot_leave_detached_descendants",
             successful_background_leaders_cannot_leave_detached_descendants,
         ),
+        #[cfg(target_os = "linux")]
         (
             "caller_cancellation_joins_every_worker_and_its_descendants",
             caller_cancellation_joins_every_worker_and_its_descendants,
         ),
+        #[cfg(target_os = "linux")]
         (
             "partial_pipeline_start_failure_also_cleans_up_prior_background_groups",
             partial_pipeline_start_failure_also_cleans_up_prior_background_groups,
@@ -121,18 +140,22 @@ pub(super) fn main() {
             "unreachable_parallel_requests_do_not_change_default_ordering",
             unreachable_parallel_requests_do_not_change_default_ordering,
         ),
+        #[cfg(target_os = "linux")]
         (
             "skipped_wait_targets_are_not_inferred_to_have_succeeded",
             skipped_wait_targets_are_not_inferred_to_have_succeeded,
         ),
+        #[cfg(target_os = "linux")]
         (
             "pending_background_work_has_a_running_outcome_and_is_not_inferred_successful",
             pending_background_work_has_a_running_outcome_and_is_not_inferred_successful,
         ),
+        #[cfg(target_os = "linux")]
         (
             "scheduler_preparation_errors_cancel_and_join_already_started_background_workers",
             scheduler_preparation_errors_cancel_and_join_already_started_background_workers,
         ),
+        #[cfg(target_os = "linux")]
         (
             "background_job_timeout_and_caller_cancellation_stop_nested_process_trees",
             background_job_timeout_and_caller_cancellation_stop_nested_process_trees,
@@ -141,6 +164,7 @@ pub(super) fn main() {
             "job_lowering_keeps_remote_execution_trust_on_referenced_bodies",
             job_lowering_keeps_remote_execution_trust_on_referenced_bodies,
         ),
+        #[cfg(target_os = "linux")]
         (
             "an_exited_owned_pipeline_leader_cannot_keep_a_downstream_reader_waiting_for_eof",
             an_exited_owned_pipeline_leader_cannot_keep_a_downstream_reader_waiting_for_eof,
@@ -590,6 +614,81 @@ fn outcomes(report: &TaskRunReport) -> Vec<(&str, TaskOutcome)> {
 }
 
 fn unavailable_backend_refuses_execution_but_dry_run_only_plans() {
+    assert_unavailable_backend_refuses_before_effects(false);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_explicit_owned_backend_refuses_before_effects() {
+    assert_unavailable_backend_refuses_before_effects(true);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_explicit_backend_preserves_foreground_runners() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let runners = root.path().join("runners");
+    fs::create_dir(&runners).unwrap();
+    let runner = runners.join("capture");
+    fs::write(&runner, "#!/bin/sh\n/usr/bin/touch \"$1\"\n").unwrap();
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).unwrap();
+    let definitions = tasks(
+        root.path(),
+        r"
+tasks:
+  portable: {uses: portable, run: '/usr/bin/touch portable'}
+  argv: {uses: argv, run: /usr/bin/touch, args: [argv]}
+  shell: {uses: shell, run: '/usr/bin/touch shell'}
+  fallback: {uses: capture, run: fallback}
+  finish: {needs: [portable, argv, shell, fallback]}
+",
+    );
+    let values = IndexMap::new();
+    let cancellation = TaskCancellation::new();
+    let report = run_tasks_with_cancellation(
+        &definitions,
+        "finish",
+        "default",
+        root.path(),
+        TaskEnvironment {
+            values: &values,
+            path_operations: &[],
+            overrides: None,
+        },
+        &[],
+        TaskRunOptions {
+            ssh_output_to_stderr: false,
+            ssh_secret_values: &[],
+            inventories: None,
+            managed_runtimes: &[],
+            vaults: None,
+            dry_run: false,
+            cancellation: &cancellation,
+            capability_grants: None,
+            capability_policy_source: None,
+            remote_tasks: None,
+            task_directories: TaskRunnerDirectories {
+                local: &["runners".into()],
+                global: &[],
+            },
+            input_values: None,
+            owned_backend: Some(owned_backend()),
+        },
+    )
+    .unwrap();
+    assert!(
+        report
+            .tasks
+            .iter()
+            .all(|task| task.outcome == TaskOutcome::Succeeded),
+        "{report:?}"
+    );
+    for marker in ["portable", "argv", "shell", "fallback"] {
+        assert!(root.path().join(marker).is_file(), "{marker}");
+    }
+}
+
+fn assert_unavailable_backend_refuses_before_effects(explicit_backend: bool) {
     let root = tempfile::tempdir().unwrap();
     let definitions = tasks(
         root.path(),
@@ -636,7 +735,7 @@ tasks:
                 remote_tasks: None,
                 task_directories: TaskRunnerDirectories::default(),
                 input_values: None,
-                owned_backend: None,
+                owned_backend: explicit_backend.then(owned_backend),
             },
         );
         if dry_run {
@@ -1057,10 +1156,12 @@ fn graph_budget_is_checked_before_effects_in_both_execution_and_dry_run() {
             },
         )
         .unwrap_err();
-        assert!(
-            error.to_string().contains("at most 32 background tasks"),
-            "{error}"
-        );
+        let expected = if dry_run || cfg!(target_os = "linux") {
+            "at most 32 background tasks"
+        } else {
+            "exclusive child ownership"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
         assert!(!root.path().join("wrong").exists());
     }
 }

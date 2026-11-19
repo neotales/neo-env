@@ -41,39 +41,28 @@ use super::{
 #[cfg(windows)]
 #[test]
 fn windows_git_init_compares_canonical_and_native_staging_paths() {
-    // Exercise the production runner and options, including the hostile
-    // configuration environment, without printing Git's untrusted stderr.
+    // Exercise the production initialization, not an approximate command.
+    // Only fixed labels are printed; Git's stderr can contain paths.
     fn run(path: &Path) -> (bool, &'static str) {
-        let mut command = Command::new("git");
-        command
-            .args(super::git_options())
-            .arg("init")
-            .arg(path)
-            .env("GIT_CONFIG_COUNT", "2")
-            .env("GIT_CONFIG_KEY_0", "url.https://127.0.0.1:9/.insteadOf")
-            .env("GIT_CONFIG_VALUE_0", "fixture-origin")
-            .env("GIT_CONFIG_KEY_1", "url.ssh://127.0.0.1:9/.insteadOf")
-            .env("GIT_CONFIG_VALUE_1", "fixture-origin")
-            .env(
-                "GIT_CONFIG_PARAMETERS",
-                "'url.https://127.0.0.1:9/.insteadOf'='fixture-origin'",
-            );
-        let output = match super::run_git_output(&mut command, None) {
-            Ok(output) => output,
+        let error = match super::initialize_git_repository(path, None) {
+            Ok(()) => return (true, "success"),
             Err(error) => {
-                let category = match error {
-                    RemoteError::IoSource { .. } | RemoteError::Io(_) => "runner-io-error",
-                    RemoteError::PolicySource { .. } | RemoteError::InvalidPolicy(_) => {
-                        "runner-policy-error"
-                    }
-                    RemoteError::Cancelled => "runner-cancelled",
-                    RemoteError::Git(_) => "runner-git-error",
-                    _ => "runner-other-error",
-                };
-                return (false, category);
+                if error.git_failure().is_none() {
+                    let category = match error {
+                        RemoteError::IoSource { .. } | RemoteError::Io(_) => "runner-io-error",
+                        RemoteError::PolicySource { .. } | RemoteError::InvalidPolicy(_) => {
+                            "runner-policy-error"
+                        }
+                        RemoteError::Cancelled => "runner-cancelled",
+                        RemoteError::Git(_) => "runner-git-error",
+                        _ => "runner-other-error",
+                    };
+                    return (false, category);
+                }
+                error
             }
         };
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        let stderr = error.git_failure().unwrap().stderr.to_ascii_lowercase();
         let kind = if stderr.contains("filename too long") || stderr.contains("path too long") {
             "path-too-long"
         } else if stderr.contains("invalid argument") || stderr.contains("invalid path") {
@@ -87,7 +76,7 @@ fn windows_git_init_compares_canonical_and_native_staging_paths() {
         } else {
             "other-or-empty"
         };
-        (output.status.success(), kind)
+        (false, kind)
     }
 
     let root = TempDir::new().unwrap();
@@ -185,10 +174,7 @@ fn git_fetch_reports_the_failing_stage_without_exposing_paths() {
     let occupied = directory.path().join("occupied");
     fs::write(&occupied, b"not a directory").unwrap();
     let init_error = super::git_fetch(&module, &occupied, None, &transport).unwrap_err();
-    assert_eq!(
-        init_error.git_failure().unwrap().operation,
-        "initialize module repository"
-    );
+    assert!(matches!(init_error, RemoteError::Io(_)));
     assert!(
         !init_error
             .to_string()
@@ -208,6 +194,51 @@ fn git_fetch_reports_the_failing_stage_without_exposing_paths() {
             .to_string()
             .contains(&missing.display().to_string())
     );
+}
+
+#[test]
+fn git_initialization_requires_an_empty_owned_staging_directory() {
+    let root = TempDir::new().unwrap();
+    let existing = root.path().join("existing");
+    fs::create_dir(&existing).unwrap();
+    super::initialize_git_repository(&existing, None).unwrap();
+    assert!(existing.join(".git").is_dir());
+
+    let occupied = root.path().join("occupied");
+    fs::create_dir(&occupied).unwrap();
+    fs::write(occupied.join("keep"), b"untouched").unwrap();
+    assert!(super::initialize_git_repository(&occupied, None).is_err());
+    assert_eq!(fs::read(occupied.join("keep")).unwrap(), b"untouched");
+    assert!(!occupied.join(".git").exists());
+
+    #[cfg(unix)]
+    {
+        let link = root.path().join("link");
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(super::initialize_git_repository(&link, None).is_err());
+        assert!(!target.join(".git").exists());
+    }
+}
+
+#[test]
+fn failed_fetch_does_not_strand_owned_staging_content() {
+    let root = TempDir::new().unwrap();
+    let module =
+        RemoteModule::parse("github:octo/repo@0123456789abcdef0123456789abcdef01234567").unwrap();
+    let transport = LocalGitTransport {
+        repository: module.repository.clone(),
+        url: root.path().join("missing").display().to_string(),
+    };
+    let staging = tempfile::Builder::new()
+        .prefix("neoenv-module-")
+        .tempdir_in(root.path())
+        .unwrap();
+    let path = staging.path().to_owned();
+    assert!(super::git_fetch(&module, &path.join("source"), None, &transport).is_err());
+    drop(staging);
+    assert!(!path.exists());
 }
 
 #[test]

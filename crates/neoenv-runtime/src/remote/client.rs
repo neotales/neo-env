@@ -489,16 +489,7 @@ pub(super) fn git_fetch<T: GitTransport + ?Sized>(
     cancellation: Option<&TaskCancellation>,
     transport: &T,
 ) -> Result<String, RemoteError> {
-    run_git(
-        &[
-            "init",
-            destination
-                .to_str()
-                .ok_or_else(|| RemoteError::Io("non-UTF-8 cache path".into()))?,
-        ],
-        cancellation,
-        "initialize module repository",
-    )?;
+    initialize_git_repository(destination, cancellation)?;
     let reference = match &module.reference {
         RemoteReference::Commit(commit) => commit.clone(),
         RemoteReference::Tag(tag) => format!("refs/tags/{tag}"),
@@ -522,6 +513,57 @@ pub(super) fn git_fetch<T: GitTransport + ?Sized>(
         "checkout fetched module",
     )?;
     Ok(resolved)
+}
+
+pub(super) fn initialize_git_repository(
+    destination: &Path,
+    cancellation: Option<&TaskCancellation>,
+) -> Result<(), RemoteError> {
+    match fs::create_dir(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(destination).map_err(|error| {
+                RemoteError::io_source("inspect module staging directory", error)
+            })?;
+            if !metadata.file_type().is_dir() {
+                return Err(RemoteError::Io("unsafe module staging directory".into()));
+            }
+            let mut entries = fs::read_dir(destination).map_err(|error| {
+                RemoteError::io_source("inspect module staging directory", error)
+            })?;
+            match entries.next() {
+                None => {}
+                Some(Ok(_)) => {
+                    return Err(RemoteError::Io(
+                        "module staging directory is not empty".into(),
+                    ));
+                }
+                Some(Err(error)) => {
+                    return Err(RemoteError::io_source(
+                        "inspect module staging directory",
+                        error,
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(RemoteError::io_source(
+                "create module staging directory",
+                error,
+            ));
+        }
+    }
+    // Git for Windows rejects verbatim paths as init arguments. The private
+    // staging directory is already selected; pass it as cwd rather than as a
+    // Git path argument, without changing transport or configuration policy.
+    run_git_command(
+        Command::new("git")
+            .args(git_options())
+            .current_dir(destination)
+            .args(["init", "."]),
+        cancellation,
+        "initialize module repository",
+    )
 }
 
 #[cfg(test)]
@@ -966,18 +1008,6 @@ pub(super) fn tag_metadata_for(module: &RemoteModule, commit: &str) -> String {
         "canonical = {:?}\ncommit = {:?}\n",
         module.canonical(),
         commit
-    )
-}
-
-pub(super) fn run_git(
-    arguments: &[&str],
-    cancellation: Option<&TaskCancellation>,
-    operation: &'static str,
-) -> Result<(), RemoteError> {
-    run_git_command(
-        Command::new("git").args(git_options()).args(arguments),
-        cancellation,
-        operation,
     )
 }
 

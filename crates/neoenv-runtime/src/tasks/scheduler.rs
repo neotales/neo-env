@@ -2068,6 +2068,17 @@ fn execute_task(
         .get("timeout")
         .map(|value| parse_timeout(value))
         .transpose()?;
+    // Background work must never fall back to the historical adapter. On
+    // Unix, use the owned foreground adapter only where it is implemented;
+    // Windows deliberately retains its existing foreground adapter.
+    let use_owned = owned_background
+        || (cfg!(not(windows))
+            && super::owned_process::supported(
+                scope
+                    .options
+                    .owned_backend
+                    .map(|backend| backend.executable()),
+            ));
     let execution = match action.uses.as_deref() {
         Some("exec" | "portable") => render_portable(required_run(action)?, &task_environment)
             .and_then(|rendered| {
@@ -2084,9 +2095,7 @@ fn execute_task(
                             is_cancelled: &is_cancelled,
                             timeout,
                         };
-                        if owned_background
-                            || (cfg!(not(windows)) && scope.options.owned_backend.is_some())
-                        {
+                        if use_owned {
                             scope.options.owned_backend.map_or_else(
                                 || Err("owned background execution is unavailable".into()),
                                 |backend| {
@@ -2114,7 +2123,7 @@ fn execute_task(
                 is_cancelled: &is_cancelled,
                 timeout,
             };
-            if owned_background || (cfg!(not(windows)) && scope.options.owned_backend.is_some()) {
+            if use_owned {
                 scope.options.owned_backend.map_or_else(
                     || Err("owned background execution is unavailable".into()),
                     |backend| {
@@ -2147,7 +2156,7 @@ fn execute_task(
                 is_cancelled: &is_cancelled,
                 timeout,
             };
-            if owned_background || (cfg!(not(windows)) && scope.options.owned_backend.is_some()) {
+            if use_owned {
                 scope.options.owned_backend.map_or_else(
                     || Err("owned background execution is unavailable".into()),
                     |backend| {
@@ -2228,7 +2237,7 @@ fn execute_task(
                 is_cancelled: &is_cancelled,
                 timeout,
             };
-            if owned_background || (cfg!(not(windows)) && scope.options.owned_backend.is_some()) {
+            if use_owned {
                 scope.options.owned_backend.map_or_else(
                     || Err("owned background execution is unavailable".into()),
                     |backend| {

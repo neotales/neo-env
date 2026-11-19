@@ -14,6 +14,13 @@ cleans up their process group. Portable command-chain forms whose stages cannot
 be supervised fail closed when background execution is requested. Dry-run
 validates and plans without starting a helper.
 
+The Linux owned supervisor's waitable-leader process-group cleanup primitive is
+not a portability contract for macOS. A Darwin-only CI diagnostic records the
+result for a waitable zombie-only group and for a group with a ready descendant;
+it expects the observed zombie-only `EPERM` but does not infer a safe cleanup
+strategy from either result. In particular, this diagnostic does not enable
+owned supervision on macOS or change how production cleanup handles errors.
+
 Tasks and job steps run in their existing dependency/declaration order unless
 overlap is requested. These controls are structured concurrency, not exact
 GitHub Actions syntax, a detached-service manager, or a readiness check.

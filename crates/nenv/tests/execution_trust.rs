@@ -1043,6 +1043,57 @@ struct LocalGitFixture {
     package_sha256: String,
 }
 
+fn local_git_transport_path(local: &LocalGitFixture) -> String {
+    let module = neoenv_runtime::remote::RemoteModule::parse(&local.spec).unwrap();
+    let path = module.local_path().unwrap();
+    #[cfg(windows)]
+    let path = path.replace('/', "\\");
+    #[cfg(not(windows))]
+    let path = path.to_owned();
+    // The runtime passes this normalized local_path to Git, not the verbatim
+    // spelling used to construct the source fixture.
+    assert!(
+        Path::new(&path).canonicalize().unwrap() == local.origin,
+        "transport path must identify the fixture repository"
+    );
+    path
+}
+
+fn assert_hostile_rewrite_matches_transport(path: &str) {
+    // --get-url expands insteadOf but does not contact a remote. Even if Git
+    // changes that behavior, protocol.allow=never forbids every transport.
+    // Exercise both independent inherited-configuration channels without the
+    // runtime's sanitization, so the protected fetch cannot pass vacuously.
+    for legacy in [false, true] {
+        let mut command = Command::new("git");
+        command
+            .args(["-c", "protocol.allow=never", "ls-remote", "--get-url", path])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env("GIT_CONFIG_COUNT", "0");
+        if legacy {
+            command.env(
+                "GIT_CONFIG_PARAMETERS",
+                format!("'url.https://127.0.0.1:9/.insteadOf'='{path}'"),
+            );
+        } else {
+            command
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "url.https://127.0.0.1:9/.insteadOf")
+                .env("GIT_CONFIG_VALUE_0", path);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "rewrite control failed");
+        assert!(
+            output.stdout == b"https://127.0.0.1:9/\n"
+                || output.stdout == b"https://127.0.0.1:9/\r\n",
+            "hostile rewrite did not match the Git transport path"
+        );
+    }
+}
+
 // Null output prevents descendants holding pipes or producing unbounded logs.
 // Only the direct child is killed on timeout; Git descendants are not managed
 // by this approximate diagnostic and may outlive it.
@@ -1212,6 +1263,83 @@ fn local_git_fixture() -> LocalGitFixture {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_public_local_git_fetch_uses_canonical_project_and_pins_checkout() {
+    use std::path::{Component, Prefix};
+
+    let local = local_git_fixture();
+    let fixture = &local.fixture;
+    let project = neoenv_runtime::discovery::discover(&fixture.project, None, None)
+        .unwrap()
+        .unwrap()
+        .project_root;
+    assert!(matches!(
+        project.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _))
+    ));
+    let denied = fixture.run(&["remote", "fetch", &local.spec]);
+    assert_eq!(denied.status.code(), Some(5));
+    assert!(!fixture.path(".neoenv/modules").exists());
+    let trust = fixture
+        .command()
+        .args(["trust", "add"])
+        .arg(format!("file://{}", local.origin.display()))
+        .output()
+        .unwrap();
+    assert!(trust.status.success());
+    let origin_path = local_git_transport_path(&local);
+    assert_hostile_rewrite_matches_transport(&origin_path);
+    let fetched = fixture
+        .command()
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "url.https://127.0.0.1:9/.insteadOf")
+        .env("GIT_CONFIG_VALUE_0", &origin_path)
+        .env("GIT_CONFIG_KEY_1", "url.ssh://127.0.0.1:9/.insteadOf")
+        .env("GIT_CONFIG_VALUE_1", &origin_path)
+        .env(
+            "GIT_CONFIG_PARAMETERS",
+            format!("'url.https://127.0.0.1:9/.insteadOf'='{origin_path}'"),
+        )
+        .args(["remote", "fetch", &local.spec])
+        .output()
+        .unwrap();
+    let message = String::from_utf8_lossy(&fetched.stderr);
+    let stage = [
+        "initialize module repository",
+        "fetch module",
+        "resolve fetched module revision",
+        "checkout fetched module",
+        "read pinned module tree",
+    ]
+    .into_iter()
+    .find(|stage| message.contains(stage))
+    .unwrap_or("other");
+    assert!(
+        fetched.status.success(),
+        "public fetch failed with status {:?}, stage={stage}",
+        fetched.status.code()
+    );
+    assert!(local.cached.is_file());
+    let module = neoenv_runtime::remote::RemoteModule::parse(&local.spec).unwrap();
+    let checkout = local.cached.ancestors().nth(3).unwrap();
+    let revision = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(revision.status.success());
+    let neoenv_runtime::remote::RemoteReference::Commit(expected) = module.reference else {
+        panic!("fixture must use a commit");
+    };
+    assert_eq!(String::from_utf8(revision.stdout).unwrap().trim(), expected);
+    fixture.approve_root();
+    Fixture::assert_trust_refusal(&fixture.run(&["task", "run", "check"]));
+    assert!(!fixture.path("local-git-package-ran").exists());
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn a_local_git_task_package_fetches_then_needs_execution_trust() {
@@ -1246,7 +1374,8 @@ fn a_local_git_task_package_fetches_then_needs_execution_trust() {
     // environment tries to rewrite the local path to HTTPS/SSH through Git's
     // config-in-environment channel; the fetch must ignore that channel and
     // the non-file protocols are denied, so no network request can be made.
-    let origin_path = local.origin.display().to_string();
+    let origin_path = local_git_transport_path(&local);
+    assert_hostile_rewrite_matches_transport(&origin_path);
     let fetched = fixture
         .command()
         .env("GIT_CONFIG_COUNT", "2")
@@ -1271,6 +1400,22 @@ fn a_local_git_task_package_fetches_then_needs_execution_trust() {
         }
     );
     assert!(local.cached.is_file(), "subfolder document was not cached");
+    let checkout = local.cached.ancestors().nth(3).unwrap();
+    let revision = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        revision.status.success(),
+        "cached revision could not be read"
+    );
+    let expected = neoenv_runtime::remote::RemoteModule::parse(&local.spec).unwrap();
+    let neoenv_runtime::remote::RemoteReference::Commit(expected) = expected.reference else {
+        panic!("fixture must use a commit");
+    };
+    assert_eq!(String::from_utf8(revision.stdout).unwrap().trim(), expected);
     assert!(
         !fixture.path("local-git-package-ran").exists(),
         "fetch must not execute the task"
