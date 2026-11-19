@@ -158,6 +158,9 @@ pub struct TaskDefinition {
     pub description: Option<String>,
     pub help: Option<String>,
     pub action: Option<TaskAction>,
+    /// Ordered inline actions for an explicitly composite task.
+    #[serde(skip)]
+    pub composite_steps: Vec<CompositeStep>,
     pub needs: Vec<String>,
     /// `Some(true)` overlaps following tasks until joined; absence inherits.
     pub background: Option<bool>,
@@ -193,6 +196,17 @@ pub struct TaskDefinition {
     pub execution_grant_required: bool,
 }
 
+/// One inline action in a composite task.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CompositeStep {
+    /// Explicitly selected action runner.
+    pub uses: String,
+    /// Command passed to the selected runner.
+    pub run: String,
+    /// Source document for diagnostics and package provenance.
+    pub source_document: Option<SourceSpan>,
+}
+
 /// An owned, isolated step graph used when a job itself overlaps other jobs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskSequence {
@@ -204,6 +218,18 @@ pub struct TaskSequence {
     pub context: String,
     /// Optional whole-job deadline, in the same positive units as task timeout.
     pub timeout: Option<String>,
+    /// Distinguishes an ordered composite from a job DAG at runtime.
+    pub kind: TaskSequenceKind,
+}
+
+/// Execution semantics for an owned task sequence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TaskSequenceKind {
+    /// A normal job, whose all-container graph can use DAG scheduling.
+    #[default]
+    Job,
+    /// A sequential sequence lowered from inline composite actions.
+    Composite,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

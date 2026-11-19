@@ -464,6 +464,9 @@ pub(super) enum StructuredTask {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StructuredTaskMap {
+    /// Ordered inline actions for `uses: composite`.
+    #[serde(default)]
+    pub(super) steps: Vec<StructuredCompositeStep>,
     pub(super) background: Option<bool>,
     #[serde(default)]
     pub(super) wait: StringList,
@@ -532,6 +535,13 @@ pub(super) struct StructuredTaskMap {
     /// than a silent winner.
     #[serde(default)]
     pub(super) timeout: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StructuredCompositeStep {
+    pub(super) uses: String,
+    pub(super) run: String,
 }
 
 #[derive(Deserialize)]
@@ -801,6 +811,14 @@ pub(super) enum StringList {
 }
 
 impl StringList {
+    pub(super) fn is_empty(&self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Scalar(_) => false,
+            Self::List(values) => values.is_empty(),
+        }
+    }
+
     pub(super) fn into_vec(self) -> Vec<String> {
         match self {
             Self::Empty => Vec::new(),

@@ -536,6 +536,112 @@ fn task_capability_denial_is_a_trust_error_with_policy_provenance() {
 }
 
 #[test]
+fn composite_capability_denial_preflights_before_the_first_step() {
+    let (directory, path) = write_project(
+        "tasks:\n  prepare:\n    uses: shell\n    run: 'touch before-composite'\n  release:\n    needs: prepare\n    uses: composite\n    capabilities: [execute]\n    steps:\n      - uses: shell\n        run: 'touch composite-effect'\n",
+    );
+    let policy = directory.path().join("capabilities.toml");
+    let output = command()
+        .arg("task")
+        .arg("run")
+        .arg("release")
+        .arg(&path)
+        .arg("--capability-policy")
+        .arg(&policy)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    assert!(
+        !directory.path().join("composite-effect").exists(),
+        "a denied composite must not start any step"
+    );
+    assert!(
+        !directory.path().join("before-composite").exists(),
+        "capability preflight must include later composites before earlier effects"
+    );
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("requested capability execute is not granted")
+    );
+}
+
+#[test]
+fn task_grants_preserve_explicit_id_for_ordinary_and_composite_tasks() {
+    for action in [
+        "    uses: shell\n    run: 'true'\n",
+        "    uses: composite\n    steps:\n      - uses: shell\n        run: 'true'\n",
+    ] {
+        let (directory, path) = write_project(&format!(
+            "tasks:\n  build:\n    id: stable-id\n    capabilities: [execute]\n{action}"
+        ));
+        let policy = directory.path().join("capabilities.toml");
+        let root = directory.path().canonicalize().unwrap();
+        let grant = |id: &str| {
+            let subject = format!("project:{}/task:{id}", root.display());
+            fs::write(
+                &policy,
+                format!("[[grants]]\nsubject = {subject:?}\ncapability = 'execute'\n"),
+            )
+            .unwrap();
+        };
+        let run = || {
+            command()
+                .arg("task")
+                .arg("run")
+                .arg("build")
+                .arg(&path)
+                .arg("--capability-policy")
+                .arg(&policy)
+                .output()
+                .unwrap()
+        };
+        grant("build");
+        let denied = run();
+        assert_eq!(denied.status.code(), Some(5), "{denied:?}");
+        grant("stable-id");
+        let allowed = run();
+        assert!(allowed.status.success(), "{allowed:?}");
+    }
+}
+
+#[test]
+fn referenced_job_steps_preserve_lowered_grant_identity() {
+    for action in [
+        "    uses: shell\n    run: 'true'\n",
+        "    uses: composite\n    steps:\n      - uses: shell\n        run: 'true'\n",
+    ] {
+        let (directory, _path) = write_project(&format!(
+            "tasks:\n  build:\n    id: stable-id\n    capabilities: [execute]\n{action}jobs:\n  release:\n    steps:\n      - task: build\n"
+        ));
+        let policy = directory.path().join("capabilities.toml");
+        let root = directory.path().canonicalize().unwrap();
+        let grant = |id: &str| {
+            let subject = format!("project:{}/task:{id}", root.display());
+            fs::write(
+                &policy,
+                format!("[[grants]]\nsubject = {subject:?}\ncapability = 'execute'\n"),
+            )
+            .unwrap();
+        };
+        let run = || {
+            command()
+                .current_dir(directory.path())
+                .env("NEOENV_CAPABILITY_POLICY", &policy)
+                .args(["job", "run", "release"])
+                .output()
+                .unwrap()
+        };
+        grant("stable-id");
+        let denied = run();
+        assert_eq!(denied.status.code(), Some(5), "{denied:?}");
+        grant("release:1");
+        let allowed = run();
+        assert!(allowed.status.success(), "{allowed:?}");
+    }
+}
+
+#[test]
 fn task_environment_interpolates_and_handoffs_require_declared_outputs() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("neoenv.yaml");

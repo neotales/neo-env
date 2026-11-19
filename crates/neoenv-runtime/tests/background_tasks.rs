@@ -10,10 +10,14 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use neoenv_core::tasks::{TaskDefinition, TaskOutcome, resolve_inheritance};
+use neoenv_core::tasks::{
+    CompositeStep, TaskAction, TaskCapabilityRequest, TaskDefinition, TaskEdgeOrigin, TaskOutcome,
+    TaskPackageIdentity, TaskSequence, TaskSequenceKind, resolve_inheritance,
+};
+use neoenv_policy::CapabilityGrants;
 use neoenv_runtime::tasks::{
-    CooperativeOwnedBackend, TaskCancellation, TaskEnvironment, TaskRunOptions, TaskRunReport,
-    TaskRunnerDirectories, run_tasks_with_cancellation,
+    CooperativeOwnedBackend, TaskCancellation, TaskEnvironment, TaskRunError, TaskRunOptions,
+    TaskRunReport, TaskRunnerDirectories, run_tasks_with_cancellation,
 };
 
 #[path = "../../nenv/src/task_supervisor.rs"]
@@ -36,6 +40,38 @@ pub(super) fn main() {
         (
             "unavailable_backend_refuses_execution_but_dry_run_only_plans",
             unavailable_backend_refuses_execution_but_dry_run_only_plans,
+        ),
+        (
+            "composite_steps_run_in_order_and_stop_after_failure",
+            composite_steps_run_in_order_and_stop_after_failure,
+        ),
+        (
+            "composite_only_dependencies_remain_sequential",
+            composite_only_dependencies_remain_sequential,
+        ),
+        (
+            "composite_caller_and_package_grants_keep_distinct_subjects",
+            composite_caller_and_package_grants_keep_distinct_subjects,
+        ),
+        (
+            "nested_job_composite_capability_denial_preflights_before_effects",
+            nested_job_composite_capability_denial_preflights_before_effects,
+        ),
+        (
+            "invalid_composite_timeout_preflights_before_dependency_effects",
+            invalid_composite_timeout_preflights_before_dependency_effects,
+        ),
+        (
+            "composite_dry_run_does_not_spawn_steps",
+            composite_dry_run_does_not_spawn_steps,
+        ),
+        (
+            "composite_timeout_stops_the_sequence",
+            composite_timeout_stops_the_sequence,
+        ),
+        (
+            "composite_cancellation_stops_the_sequence",
+            composite_cancellation_stops_the_sequence,
         ),
         (
             "background_launch_overlaps_then_named_wait_publishes_outputs_and_environment",
@@ -173,6 +209,289 @@ pub(super) fn main() {
     }
 }
 
+fn composite_steps_run_in_order_and_stop_after_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("order");
+    let marker = marker.display().to_string();
+    let definitions = tasks(
+        root.path(),
+        &format!(
+            "tasks:\n  finish:\n    uses: composite\n    steps:\n      - uses: shell\n        run: 'printf first >> {marker}'\n      - uses: shell\n        run: 'exit 7'\n      - uses: shell\n        run: 'printf third >> {marker}'\n"
+        ),
+    );
+    let cancellation = TaskCancellation::default();
+    let report = execute(root.path(), &definitions, &cancellation, false);
+    assert_eq!(report.tasks[0].outcome, TaskOutcome::Failed);
+    assert_eq!(
+        fs::read_to_string(root.path().join("order")).unwrap(),
+        "first"
+    );
+}
+
+fn composite_only_dependencies_remain_sequential() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("order");
+    let definitions = tasks(
+        root.path(),
+        &format!(
+            "tasks:\n  prepare:\n    uses: composite\n    steps:\n      - uses: shell\n        run: 'printf first >> {}'\n  finish:\n    needs: prepare\n    uses: composite\n    steps:\n      - uses: shell\n        run: 'printf second >> {}'\n",
+            marker.display(),
+            marker.display(),
+        ),
+    );
+    let cancellation = TaskCancellation::default();
+    let report = execute(root.path(), &definitions, &cancellation, false);
+    assert_eq!(report.tasks.len(), 2);
+    assert!(
+        report
+            .tasks
+            .iter()
+            .all(|task| task.outcome == TaskOutcome::Succeeded),
+        "{:?}",
+        report.tasks
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap(), "firstsecond");
+}
+
+fn composite_caller_and_package_grants_keep_distinct_subjects() {
+    let root = tempfile::tempdir().unwrap();
+    let caller_subject = format!(
+        "project:{}/task:release-v2",
+        root.path().canonicalize().unwrap().display()
+    );
+    let caller_grants = CapabilityGrants::from_toml(&format!(
+        "[[grants]]\nsubject = {caller_subject:?}\ncapability = 'execute'\n"
+    ))
+    .unwrap();
+    let package_grants = CapabilityGrants::from_toml(
+        "[[grants]]\nsubject = 'package:composite-digest'\ncapability = 'execute'\n",
+    )
+    .unwrap();
+    let mut task = TaskDefinition {
+        id: Some("release-v2".into()),
+        action: Some(TaskAction {
+            uses: Some("composite".into()),
+            ..TaskAction::default()
+        }),
+        composite_steps: vec![CompositeStep {
+            uses: "shell".into(),
+            run: "touch caller-granted".into(),
+            source_document: None,
+        }],
+        execution_grant_required: true,
+        ..TaskDefinition::default()
+    };
+    let mut task_map = IndexMap::new();
+    task_map.insert("finish".into(), task.clone());
+    let cancellation = TaskCancellation::default();
+    let caller_report =
+        execute_with_grants(root.path(), &task_map, &cancellation, &caller_grants).unwrap();
+    assert_eq!(caller_report.tasks[0].outcome, TaskOutcome::Succeeded);
+    assert!(root.path().join("caller-granted").exists());
+
+    task.composite_steps[0].run = "touch caller-wrong-subject".into();
+    task_map.insert("finish".into(), task.clone());
+    let denied =
+        execute_with_grants(root.path(), &task_map, &cancellation, &package_grants).unwrap_err();
+    assert!(denied.to_string().contains("is not granted"));
+    assert!(!root.path().join("caller-wrong-subject").exists());
+
+    task.composite_steps[0].run = "touch package-granted".into();
+    task.execution_grant_required = false;
+    task.package = Some(TaskPackageIdentity {
+        path: "package.yaml".into(),
+        sha256: "composite-digest".into(),
+        export: "default".into(),
+        root: root.path().to_path_buf(),
+        external: false,
+    });
+    task.capability_requests = vec![TaskCapabilityRequest {
+        capability: "execute".into(),
+        origin: TaskEdgeOrigin::Package,
+    }];
+    task_map.insert("finish".into(), task.clone());
+    let package_report =
+        execute_with_grants(root.path(), &task_map, &cancellation, &package_grants).unwrap();
+    assert_eq!(package_report.tasks[0].outcome, TaskOutcome::Succeeded);
+    assert!(root.path().join("package-granted").exists());
+
+    task.composite_steps[0].run = "touch cross-subject".into();
+    task_map.insert("finish".into(), task);
+    let denied =
+        execute_with_grants(root.path(), &task_map, &cancellation, &caller_grants).unwrap_err();
+    assert!(denied.to_string().contains("is not granted"));
+    assert!(!root.path().join("cross-subject").exists());
+}
+
+fn nested_job_composite_capability_denial_preflights_before_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let before = root.path().join("before-denial");
+    let after = root.path().join("after-denial");
+    let mut tasks = IndexMap::new();
+    tasks.insert(
+        "prepare".into(),
+        TaskDefinition {
+            action: Some(TaskAction {
+                uses: Some("shell".into()),
+                run: Some(format!("touch {}", before.display())),
+                ..TaskAction::default()
+            }),
+            ..TaskDefinition::default()
+        },
+    );
+    tasks.insert(
+        "release".into(),
+        TaskDefinition {
+            id: Some("release".into()),
+            needs: vec!["prepare".into()],
+            action: Some(TaskAction {
+                uses: Some("composite".into()),
+                ..TaskAction::default()
+            }),
+            composite_steps: vec![CompositeStep {
+                uses: "shell".into(),
+                run: format!("touch {}", after.display()),
+                source_document: None,
+            }],
+            package: Some(TaskPackageIdentity {
+                path: "nested-package.yaml".into(),
+                sha256: "nested-composite-digest".into(),
+                export: "default".into(),
+                root: root.path().to_path_buf(),
+                external: true,
+            }),
+            ..TaskDefinition::default()
+        },
+    );
+    let sequence = TaskSequence {
+        tasks,
+        root: "release".into(),
+        context: "default".into(),
+        timeout: None,
+        kind: TaskSequenceKind::Job,
+    };
+    let mut graph = IndexMap::new();
+    graph.insert(
+        "finish".into(),
+        TaskDefinition {
+            job: Some(Box::new(sequence)),
+            ..TaskDefinition::default()
+        },
+    );
+    let error = execute_with_grants(
+        root.path(),
+        &graph,
+        &TaskCancellation::default(),
+        &CapabilityGrants::default(),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("composite-step-0"), "{message}");
+    assert!(
+        message.contains("package:nested-composite-digest"),
+        "{message}"
+    );
+    assert!(message.contains("is not granted"), "{message}");
+    assert!(!before.exists());
+    assert!(!after.exists());
+}
+
+fn invalid_composite_timeout_preflights_before_dependency_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("before-invalid-timeout");
+    let mut tasks = IndexMap::new();
+    tasks.insert(
+        "prepare".into(),
+        TaskDefinition {
+            action: Some(TaskAction {
+                uses: Some("shell".into()),
+                run: Some(format!("touch {}", marker.display())),
+                ..TaskAction::default()
+            }),
+            ..TaskDefinition::default()
+        },
+    );
+    tasks.insert(
+        "finish".into(),
+        TaskDefinition {
+            needs: vec!["prepare".into()],
+            action: Some(TaskAction {
+                uses: Some("composite".into()),
+                with: indexmap::indexmap! {"timeout".into() => "not-a-duration".into()},
+                ..TaskAction::default()
+            }),
+            composite_steps: vec![CompositeStep {
+                uses: "shell".into(),
+                run: "true".into(),
+                source_document: None,
+            }],
+            ..TaskDefinition::default()
+        },
+    );
+    let error = execute_with_grants(
+        root.path(),
+        &tasks,
+        &TaskCancellation::default(),
+        &CapabilityGrants::default(),
+    )
+    .unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert!(!marker.exists());
+}
+
+fn composite_dry_run_does_not_spawn_steps() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("ran");
+    let definitions = tasks(
+        root.path(),
+        &format!(
+            "tasks:\n  finish:\n    uses: composite\n    steps:\n      - uses: shell\n        run: 'touch {}'\n",
+            marker.display()
+        ),
+    );
+    let cancellation = TaskCancellation::default();
+    let _report = execute(root.path(), &definitions, &cancellation, true);
+    assert!(!marker.exists());
+}
+
+fn composite_timeout_stops_the_sequence() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("after-timeout");
+    let definitions = tasks(
+        root.path(),
+        &format!(
+            "tasks:\n  finish:\n    uses: composite\n    timeout: 100ms\n    steps:\n      - uses: shell\n        run: 'sleep 2'\n      - uses: shell\n        run: 'touch {}'\n",
+            marker.display()
+        ),
+    );
+    let cancellation = TaskCancellation::default();
+    let report = execute(root.path(), &definitions, &cancellation, false);
+    assert_eq!(report.tasks[0].outcome, TaskOutcome::TimedOut);
+    assert!(!marker.exists());
+}
+
+fn composite_cancellation_stops_the_sequence() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("after-cancel");
+    let definitions = tasks(
+        root.path(),
+        &format!(
+            "tasks:\n  finish:\n    uses: composite\n    steps:\n      - uses: shell\n        run: 'sleep 2'\n      - uses: shell\n        run: 'touch {}'\n",
+            marker.display()
+        ),
+    );
+    let cancellation = TaskCancellation::default();
+    let cancel = cancellation.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        cancel.cancel();
+    });
+    let report = execute(root.path(), &definitions, &cancellation, false);
+    canceller.join().unwrap();
+    assert_eq!(report.tasks[0].outcome, TaskOutcome::Cancelled);
+    assert!(!marker.exists());
+}
+
 fn owned_backend() -> CooperativeOwnedBackend<'static> {
     static EXECUTABLE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     let executable =
@@ -224,6 +543,42 @@ fn execute(
         },
     )
     .unwrap()
+}
+
+fn execute_with_grants(
+    root: &Path,
+    tasks: &IndexMap<String, TaskDefinition>,
+    cancellation: &TaskCancellation,
+    grants: &CapabilityGrants,
+) -> Result<TaskRunReport, TaskRunError> {
+    let values = IndexMap::new();
+    run_tasks_with_cancellation(
+        tasks,
+        "finish",
+        "default",
+        root,
+        TaskEnvironment {
+            values: &values,
+            path_operations: &[],
+            overrides: None,
+        },
+        &[],
+        TaskRunOptions {
+            ssh_output_to_stderr: false,
+            ssh_secret_values: &[],
+            inventories: None,
+            managed_runtimes: &[],
+            vaults: None,
+            dry_run: false,
+            cancellation,
+            capability_grants: Some(grants),
+            capability_policy_source: None,
+            remote_tasks: None,
+            task_directories: TaskRunnerDirectories::default(),
+            input_values: None,
+            owned_backend: Some(owned_backend()),
+        },
+    )
 }
 
 fn outcomes(report: &TaskRunReport) -> Vec<(&str, TaskOutcome)> {

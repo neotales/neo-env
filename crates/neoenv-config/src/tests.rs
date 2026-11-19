@@ -930,6 +930,32 @@ fn rejects_command_substitution_in_every_environment_format() {
     }
 }
 
+#[test]
+fn composite_tasks_parse_only_strict_inline_shell_steps() {
+    let valid = parse_project(
+        Path::new("neoenv.yaml"),
+        "tasks:\n  composite:\n    uses: composite\n    steps:\n      - uses: shell\n        run: 'echo first'\n      - uses: shell\n        run: 'echo second'\n",
+    )
+    .unwrap();
+    let task = &valid.tasks["composite"];
+    assert_eq!(task.composite_steps.len(), 2);
+    assert_eq!(task.composite_steps[0].uses, "shell");
+    assert_eq!(task.composite_steps[1].run, "echo second");
+
+    for invalid in [
+        "tasks:\n  composite:\n    uses: composite\n    steps: []\n",
+        "tasks:\n  composite:\n    uses: composite\n    steps:\n      - task: other\n",
+        "tasks:\n  composite:\n    uses: composite\n    steps:\n      - uses: composite\n        run: nested\n",
+        "tasks:\n  composite:\n    uses: composite\n    steps:\n      - uses: shell\n        run: ok\n        cwd: nested\n",
+        "tasks:\n  composite:\n    uses: composite\n    steps:\n      - uses: shell\n        run: '  '\n",
+    ] {
+        assert!(
+            parse_project(Path::new("neoenv.yaml"), invalid).is_err(),
+            "accepted unsupported composite form: {invalid}"
+        );
+    }
+}
+
 /// The Go task-field spellings added for #499, mapped onto the Rust model
 /// without weakening the capability model or the process-tree containment.
 mod go_task_fields {

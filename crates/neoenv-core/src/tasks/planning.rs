@@ -534,6 +534,17 @@ fn merge_task(mut base: TaskDefinition, child: TaskDefinition) -> TaskDefinition
     base.description = child.description.or(base.description);
     base.help = child.help.or(base.help);
     base.package = child.package.or(base.package);
+    if child
+        .action
+        .as_ref()
+        .and_then(|action| action.uses.as_deref())
+        .is_some_and(|runner| runner != "composite")
+    {
+        base.composite_steps.clear();
+    }
+    if !child.composite_steps.is_empty() {
+        base.composite_steps = child.composite_steps;
+    }
     base.action = match (base.action, child.action) {
         (Some(base), Some(child)) => Some(merge_action(base, child)),
         (base, child) => child.or(base),
@@ -1013,7 +1024,7 @@ fn validate_script_runner_action(
                 },
             });
         }
-    } else if uses != "render" && !inline {
+    } else if uses != "render" && uses != "composite" && !inline {
         return Err(TaskError::InvalidAction {
             task: name.to_owned(),
             message: "must specify a non-empty run value".to_owned(),
@@ -1491,6 +1502,7 @@ pub fn lower_jobs(
                     root: lowered.root,
                     context: context.to_owned(),
                     timeout: job.timeout.clone(),
+                    kind: super::TaskSequenceKind::Job,
                 })),
                 ..TaskDefinition::default()
             },

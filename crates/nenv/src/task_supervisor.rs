@@ -726,6 +726,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
+    #[allow(dead_code)] // The runtime background_tasks harness includes this module without registering its tests.
     fn errno_code(error: io::Error, base: i32) -> i32 {
         base + match error.raw_os_error() {
             Some(code) if code == Errno::EPERM as i32 => 1,

@@ -257,6 +257,41 @@ fn a_task_package_must_be_trusted_and_existing_syntax_still_works() {
 }
 
 #[test]
+fn an_untrusted_imported_composite_is_refused_before_its_first_step() {
+    let fixture = Fixture::new(
+        "task_packages:\n  helper: helper\ntasks:\n  check:\n    uses: package:helper\n",
+    );
+    fixture.write(
+        "neoenv/tasks/helper.yaml",
+        "tasks:\n  default:\n    uses: composite\n    steps:\n      - uses: shell\n        run: 'printf first >> composite-order'\n      - uses: shell\n        run: 'printf second >> composite-order'\n",
+    );
+    fixture.approve_root();
+    let refused = fixture.run(&["task", "run", "check"]);
+    Fixture::assert_trust_refusal(&refused);
+    assert!(!fixture.path("composite-order").exists());
+
+    let package = fixture
+        .path("neoenv/tasks/helper.yaml")
+        .canonicalize()
+        .unwrap();
+    let added = fixture.trust_add(&package);
+    assert!(added.status.success(), "{added:?}");
+    let output = fixture.run(&["task", "run", "check"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.path("composite-order")).unwrap(),
+        "firstsecond"
+    );
+
+    let revoked = fixture.trust_revoke(&package);
+    assert!(revoked.status.success(), "{revoked:?}");
+    fs::remove_file(fixture.path("composite-order")).unwrap();
+    let after_revocation = fixture.run(&["task", "run", "check"]);
+    Fixture::assert_trust_refusal(&after_revocation);
+    assert!(!fixture.path("composite-order").exists());
+}
+
+#[test]
 fn a_task_package_in_a_nested_subfolder_runs_when_its_path_is_trusted() {
     let fixture = Fixture::new(
         "task_packages:\n  lint:\n    from: ./tasks/lint/task.yaml\n    task: lint\ntasks:\n  check:\n    uses: package:lint\n",

@@ -62,8 +62,10 @@ pub fn is_wsl_runner(name: &str) -> bool {
 /// refused, not looked up as a file named `uv@...`.
 #[must_use]
 pub fn is_builtin_runner(name: &str) -> bool {
-    matches!(name, "portable" | "argv" | "shell" | "render" | "ssh")
-        || is_script_runner(name)
+    matches!(
+        name,
+        "portable" | "argv" | "shell" | "render" | "ssh" | "composite"
+    ) || is_script_runner(name)
         || is_template_runner(name)
         || is_wsl_runner(name)
         || name == "uv"
@@ -147,6 +149,7 @@ mod tests {
         assert!(!is_builtin_runner("templ"));
         assert!(is_wsl_runner("wsl"));
         assert!(is_builtin_runner("wsl"));
+        assert!(is_builtin_runner("composite"));
         assert!(!is_wsl_runner("bash"));
         assert!(!is_script_runner("custom"));
         assert!(!is_builtin_runner("custom"));

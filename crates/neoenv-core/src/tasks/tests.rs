@@ -16,6 +16,36 @@ fn task(needs: &[&str]) -> TaskDefinition {
 }
 
 #[test]
+fn changing_an_inherited_composite_runner_clears_its_old_steps() {
+    let tasks = indexmap! {
+        "base".into() => TaskDefinition {
+            template: true,
+            action: Some(TaskAction {
+                uses: Some("composite".into()),
+                ..TaskAction::default()
+            }),
+            composite_steps: vec![CompositeStep {
+                uses: "shell".into(),
+                run: "echo base".into(),
+                source_document: None,
+            }],
+            ..TaskDefinition::default()
+        },
+        "child".into() => TaskDefinition {
+            extends: Some("base".into()),
+            action: Some(TaskAction {
+                uses: Some("shell".into()),
+                run: Some("echo child".into()),
+                ..TaskAction::default()
+            }),
+            ..TaskDefinition::default()
+        },
+    };
+    let resolved = resolve_inheritance(&tasks).unwrap();
+    assert!(resolved["child"].composite_steps.is_empty());
+}
+
+#[test]
 fn context_precedence_and_fallback_are_deterministic() {
     assert_eq!(
         // Trimmed, and blank treated as unset, so the command line and the

@@ -35,6 +35,67 @@ pub(super) fn normalize_task(
                 source_path,
             )?;
             let task = *task;
+            if task.uses.as_deref() == Some("composite")
+                && (task.cwd.is_some()
+                    || !task.env.is_empty()
+                    || !task.args.is_empty()
+                    || !matches!(&task.dotenv, DotenvList::Empty)
+                    || task.with.keys().any(|key| key != "timeout"))
+            {
+                return Err(Diagnostic::new(
+                    DiagnosticCategory::Validation,
+                    "NEO180",
+                    format!("composite task {name} supports only steps, capabilities, and timeout"),
+                )
+                .at(SourceSpan::new(source_path.to_owned(), 1, 1)));
+            }
+            let composite_steps = task
+                .steps
+                .into_iter()
+                .map(|step| neoenv_core::tasks::CompositeStep {
+                    uses: step.uses,
+                    run: step.run,
+                    source_document: Some(SourceSpan::new(source_path.to_owned(), 1, 1)),
+                })
+                .collect::<Vec<_>>();
+            if task.uses.as_deref() == Some("composite") {
+                if composite_steps.is_empty() {
+                    return Err(Diagnostic::new(
+                        DiagnosticCategory::Validation,
+                        "NEO180",
+                        format!("composite task {name} requires non-empty steps"),
+                    )
+                    .at(SourceSpan::new(source_path.to_owned(), 1, 1)));
+                }
+                if task.run.is_some() || task.source.is_some() || task.destination.is_some() {
+                    return Err(Diagnostic::new(
+                        DiagnosticCategory::Validation,
+                        "NEO180",
+                        format!("composite task {name} cannot set run, source, or destination"),
+                    )
+                    .at(SourceSpan::new(source_path.to_owned(), 1, 1)));
+                }
+                if composite_steps
+                    .iter()
+                    .any(|step| step.uses != "shell" || step.run.trim().is_empty())
+                {
+                    return Err(Diagnostic::new(
+                        DiagnosticCategory::Validation,
+                        "NEO180",
+                        format!(
+                            "composite task {name} requires every step to have `uses: shell` and a non-empty `run`"
+                        ),
+                    )
+                    .at(SourceSpan::new(source_path.to_owned(), 1, 1)));
+                }
+            } else if !composite_steps.is_empty() {
+                return Err(Diagnostic::new(
+                    DiagnosticCategory::Validation,
+                    "NEO180",
+                    format!("task {name} declares steps but does not use composite"),
+                )
+                .at(SourceSpan::new(source_path.to_owned(), 1, 1)));
+            }
             let (with, files) = split_task_with(task.with, name, source_path)?;
             let has_dotenv = !matches!(&task.dotenv, DotenvList::Empty);
             let action = if task.uses.is_some()
@@ -128,6 +189,7 @@ pub(super) fn normalize_task(
                 description: task.description,
                 help: task.help,
                 action,
+                composite_steps,
                 needs: task.needs.into_vec().map_err(|error| {
                     Diagnostic::new(
                         DiagnosticCategory::Validation,

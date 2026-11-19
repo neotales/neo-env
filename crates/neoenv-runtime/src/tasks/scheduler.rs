@@ -98,6 +98,7 @@ pub fn run_tasks_with_cancellation(
         project_root,
         project_environment,
         passthrough,
+        None,
         ExecutionScope {
             options,
             owned: false,
@@ -114,12 +115,15 @@ fn run_graph(
     project_root: &Path,
     project_environment: TaskEnvironment<'_>,
     passthrough: &[String],
+    caller_subject_override: Option<&str>,
     scope: ExecutionScope<'_>,
 ) -> Result<(TaskRunReport, HandoffValues), TaskRunError> {
     let ExecutionScope {
         options,
         owned: owned_scope,
     } = scope;
+    let lowered_tasks = lower_composite_tasks(tasks, requested_name, context)?;
+    let tasks = &lowered_tasks;
     let plan = plan_task(tasks, requested_name, context)
         .map_err(|error| TaskRunError::planning_source(error.to_string(), error))?;
     let declared_environment = project_environment.values;
@@ -149,6 +153,7 @@ fn run_graph(
         &environment,
         declared_environment,
         predicate_overrides.as_ref(),
+        caller_subject_override,
     )?;
     // Reject oversized overlap before any effects. Blocking a launch when all
     // slots are occupied can deadlock a worker waiting for a later action.
@@ -197,12 +202,14 @@ fn run_graph(
             }
         }
     }
-    // Job containers are a DAG rather than a sequential task chain. Preserve
-    // the plan's report order even when ready nodes launch in a different order.
-    let jobs = plan
-        .tasks
-        .iter()
-        .all(|planned| tasks[&planned.name].job.is_some());
+    // Only explicitly typed Job containers form a DAG. Composite sequences are
+    // ordered task chains and must not activate the all-job scheduling policy.
+    let jobs = plan.tasks.iter().all(|planned| {
+        tasks[&planned.name]
+            .job
+            .as_ref()
+            .is_some_and(|sequence| sequence.kind == neoenv_core::tasks::TaskSequenceKind::Job)
+    });
     let report_order: BTreeMap<_, _> = plan
         .tasks
         .iter()
@@ -556,6 +563,7 @@ fn run_graph(
                     .spawn_scoped(scope, move || {
                         let _panic_cleanup = CancelOnPanic(cancellation.clone());
                         let execution = execute_task(
+                            &name,
                             task,
                             project_root,
                             &environment,
@@ -592,6 +600,7 @@ fn run_graph(
                 continue;
             }
             let execution = execute_task(
+                &planned.name,
                 task,
                 project_root,
                 &environment,
@@ -664,6 +673,218 @@ fn run_graph(
         },
         handoff,
     ))
+}
+
+/// Lowers only reachable composites, including those in reachable job graphs,
+/// before capability preflight, retaining the resolved task identity.
+fn lower_composite_tasks(
+    tasks: &IndexMap<String, TaskDefinition>,
+    requested_name: &str,
+    context: &str,
+) -> Result<IndexMap<String, TaskDefinition>, TaskRunError> {
+    let plan = plan_task(tasks, requested_name, context)
+        .map_err(|error| TaskRunError::planning_source(error.to_string(), error))?;
+    let mut lowered = tasks.clone();
+    for planned in plan.tasks {
+        let name = &planned.name;
+        let task = lowered.get_mut(name).expect("planned task exists");
+        if let Some(job) = task.job.as_mut() {
+            job.tasks = lower_composite_tasks(&job.tasks, &job.root, &job.context)?;
+        }
+        let is_composite = task
+            .action
+            .as_ref()
+            .and_then(|action| action.uses.as_deref())
+            == Some("composite");
+        let composite_timeout = if is_composite {
+            Some(validate_composite_task(name, task)?)
+        } else {
+            None
+        };
+        if !is_composite && !task.composite_steps.is_empty() {
+            return Err(TaskRunError::Planning(format!(
+                "task {name} has composite steps but does not use `composite`"
+            )));
+        }
+        if let Some(sequence) = task
+            .job
+            .as_ref()
+            .filter(|sequence| sequence.kind == neoenv_core::tasks::TaskSequenceKind::Composite)
+        {
+            if !matches_lowered_composite(task, sequence, context)
+                || sequence.timeout != composite_timeout.flatten()
+            {
+                return Err(TaskRunError::Planning(format!(
+                    "task {name} has an invalid composite sequence"
+                )));
+            }
+            continue;
+        }
+        if !is_composite {
+            continue;
+        }
+        if task.job.is_some() {
+            return Err(TaskRunError::Planning(format!(
+                "task {name} cannot combine composite steps with a job sequence"
+            )));
+        }
+        let mut steps = IndexMap::new();
+        let mut previous = None;
+        for (index, step) in task.composite_steps.iter().enumerate() {
+            let step_name = format!("composite-step-{index}");
+            let mut synthetic = TaskDefinition {
+                name: Some(format!("{name} step {}", index + 1)),
+                action: Some(TaskAction {
+                    uses: Some(step.uses.clone()),
+                    run: Some(step.run.clone()),
+                    source_document: step.source_document.clone(),
+                    ..TaskAction::default()
+                }),
+                package: task.package.clone(),
+                execution_grant_required: task.execution_grant_required,
+                ..TaskDefinition::default()
+            };
+            if let Some(previous_name) = previous {
+                synthetic.needs.push(previous_name);
+                synthetic
+                    .dependency_origins
+                    .needs
+                    .push(if task.package.is_some() {
+                        TaskEdgeOrigin::Package
+                    } else {
+                        TaskEdgeOrigin::Caller
+                    });
+            }
+            previous = Some(step_name.clone());
+            steps.insert(step_name, synthetic);
+        }
+        let root = previous
+            .ok_or_else(|| TaskRunError::Planning(format!("composite task {name} has no steps")))?;
+        task.job = Some(Box::new(neoenv_core::tasks::TaskSequence {
+            tasks: steps,
+            root,
+            context: context.to_owned(),
+            timeout: composite_timeout.flatten(),
+            kind: neoenv_core::tasks::TaskSequenceKind::Composite,
+        }));
+    }
+    Ok(lowered)
+}
+
+/// Checks that an already-lowered composite is exactly its declared sequential shell chain.
+fn matches_lowered_composite(
+    task: &TaskDefinition,
+    sequence: &neoenv_core::tasks::TaskSequence,
+    context: &str,
+) -> bool {
+    if sequence.tasks.len() != task.composite_steps.len() || sequence.context != context {
+        return false;
+    }
+    let mut previous: Option<String> = None;
+    for (index, ((key, child), declared)) in
+        sequence.tasks.iter().zip(&task.composite_steps).enumerate()
+    {
+        if key != &format!("composite-step-{index}")
+            || child.job.is_some()
+            || !child.composite_steps.is_empty()
+            || child.package != task.package
+            || child.execution_grant_required != task.execution_grant_required
+            || child.needs != previous.iter().cloned().collect::<Vec<_>>()
+            || !child.parallel_needs.is_empty()
+            || child.background.is_some()
+            || !child.wait.is_empty()
+            || !child.hooks.before.is_empty()
+            || !child.hooks.after.is_empty()
+            || !child.capability_requests.is_empty()
+            || !child.parameters.is_empty()
+            || !child.outputs.is_empty()
+            || child.if_condition.is_some()
+            || child.force.is_some()
+        {
+            return false;
+        }
+        let Some(action) = child.action.as_ref() else {
+            return false;
+        };
+        if action.uses.as_deref() != Some(declared.uses.as_str())
+            || action.run.as_deref() != Some(declared.run.as_str())
+            || action.source_document != declared.source_document
+            || action.source.is_some()
+            || action.destination.is_some()
+            || !action.args.is_empty()
+            || !action.files.is_empty()
+            || action.cwd.is_some()
+            || !action.env.is_empty()
+            || !action.dotenv.is_empty()
+            || !action.with.is_empty()
+            || !action.capabilities.is_empty()
+        {
+            return false;
+        }
+        previous = Some(key.clone());
+    }
+    let expected_origin = if task.package.is_some() {
+        TaskEdgeOrigin::Package
+    } else {
+        TaskEdgeOrigin::Caller
+    };
+    if sequence.tasks.values().any(|step| {
+        let expected_count = usize::from(!step.needs.is_empty());
+        step.dependency_origins.needs.len() != expected_count
+            || step
+                .dependency_origins
+                .needs
+                .iter()
+                .any(|origin| *origin != expected_origin)
+    }) {
+        return false;
+    }
+    previous.as_deref() == Some(sequence.root.as_str())
+}
+
+/// Validates a composite task independently of its representation and parses
+/// its whole-sequence deadline before any graph effects can begin.
+fn validate_composite_task(
+    name: &str,
+    task: &TaskDefinition,
+) -> Result<Option<String>, TaskRunError> {
+    let action = task
+        .action
+        .as_ref()
+        .ok_or_else(|| TaskRunError::Planning(format!("composite task {name} has no action")))?;
+    if action.run.is_some()
+        || action.source.is_some()
+        || action.destination.is_some()
+        || !action.args.is_empty()
+        || !action.files.is_empty()
+        || action.cwd.is_some()
+        || !action.env.is_empty()
+        || !action.dotenv.is_empty()
+        || action.with.keys().any(|key| key != "timeout")
+    {
+        return Err(TaskRunError::Planning(format!(
+            "composite task {name} contains unsupported action fields"
+        )));
+    }
+    if task.composite_steps.is_empty() {
+        return Err(TaskRunError::Planning(format!(
+            "composite task {name} has no steps"
+        )));
+    }
+    if task
+        .composite_steps
+        .iter()
+        .any(|step| step.uses != "shell" || step.run.trim().is_empty())
+    {
+        return Err(TaskRunError::Planning(format!(
+            "composite task {name} requires non-empty shell steps"
+        )));
+    }
+    let timeout = action.with.get("timeout").cloned();
+    if let Some(value) = timeout.as_deref() {
+        parse_timeout(value).map_err(TaskRunError::Planning)?;
+    }
+    Ok(timeout)
 }
 
 /// A graph's explicit overlap budget. Larger graphs fail before any action runs.
@@ -937,6 +1158,7 @@ fn validate_capabilities(
     environment: &BTreeMap<String, String>,
     declared_environment: &IndexMap<String, String>,
     overrides: Option<&BTreeMap<String, String>>,
+    caller_subject_override: Option<&str>,
 ) -> Result<(), TaskRunError> {
     let root = project_root.canonicalize().map_err(|error| {
         TaskRunError::io_source(
@@ -950,6 +1172,8 @@ fn validate_capabilities(
         if let Some(job) = &task.job {
             let nested = plan_task(&job.tasks, &job.root, &job.context)
                 .map_err(|error| TaskRunError::planning_source(error.to_string(), error))?;
+            let nested_subject = (job.kind == neoenv_core::tasks::TaskSequenceKind::Composite)
+                .then(|| caller_policy_subject(task, &planned_task.name, &root));
             validate_capabilities(
                 &job.tasks,
                 &nested.tasks,
@@ -958,10 +1182,12 @@ fn validate_capabilities(
                 environment,
                 declared_environment,
                 overrides,
+                nested_subject.as_deref(),
             )?;
         }
-        let task_id = task.id.as_deref().unwrap_or(&planned_task.name);
-        let caller_subject = format!("project:{}/task:{task_id}", root.display());
+        let caller_subject = caller_subject_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| caller_policy_subject(task, &planned_task.name, &root));
         let mut requests = task.capability_requests.clone();
         if requests.is_empty()
             && let Some(action) = task.action.as_ref()
@@ -1124,6 +1350,7 @@ fn validate_capabilities(
             .as_ref()
             .and_then(|action| action.uses.as_deref())
             && runner != "exec"
+            && runner != "composite"
             && !is_builtin_runner(runner)
         {
             let resolved = resolve_fallback_runner(runner, project_root, options.task_directories)
@@ -1147,6 +1374,12 @@ fn validate_capabilities(
         }
     }
     Ok(())
+}
+
+/// Uses the same resolved identity as ordinary task capability checks.
+fn caller_policy_subject(task: &TaskDefinition, original_key: &str, root: &Path) -> String {
+    let identity = task.id.as_deref().unwrap_or(original_key);
+    format!("project:{}/task:{identity}", root.display())
 }
 
 fn predicate_inputs(task: &TaskDefinition, supplied: Option<&TaskInputValues>) -> TaskInputValues {
@@ -1388,6 +1621,216 @@ fn result(
     }
 }
 
+#[cfg(test)]
+mod composite_lowering_tests {
+    use super::*;
+    use neoenv_core::tasks::CompositeStep;
+
+    fn run_with_grants(
+        root: &Path,
+        tasks: &IndexMap<String, TaskDefinition>,
+        grants: &neoenv_policy::CapabilityGrants,
+    ) -> Result<TaskRunReport, TaskRunError> {
+        let values = IndexMap::new();
+        let cancellation = TaskCancellation::default();
+        run_tasks_with_cancellation(
+            tasks,
+            "finish",
+            "default",
+            root,
+            TaskEnvironment {
+                values: &values,
+                path_operations: &[],
+                overrides: None,
+            },
+            &[],
+            TaskRunOptions {
+                ssh_output_to_stderr: false,
+                ssh_secret_values: &[],
+                inventories: None,
+                managed_runtimes: &[],
+                vaults: None,
+                dry_run: false,
+                cancellation: &cancellation,
+                capability_grants: Some(grants),
+                capability_policy_source: None,
+                remote_tasks: None,
+                task_directories: TaskRunnerDirectories::default(),
+                input_values: None,
+                owned_backend: None,
+            },
+        )
+    }
+
+    fn lowered_valid(_root: &Path) -> IndexMap<String, TaskDefinition> {
+        let mut tasks = IndexMap::new();
+        tasks.insert(
+            "finish".into(),
+            TaskDefinition {
+                action: Some(TaskAction {
+                    uses: Some("composite".into()),
+                    with: IndexMap::from([("timeout".into(), "1s".into())]),
+                    ..TaskAction::default()
+                }),
+                composite_steps: vec![CompositeStep {
+                    uses: "shell".into(),
+                    run: "true".into(),
+                    source_document: None,
+                }],
+                ..TaskDefinition::default()
+            },
+        );
+        lower_composite_tasks(&tasks, "finish", "default").unwrap()
+    }
+
+    #[test]
+    fn rejects_invalid_direct_composite_models_before_planning() {
+        for (runner, run, uses_composite) in [
+            ("portable", "true", true),
+            ("composite", "", true),
+            ("shell", "", true),
+            ("shell", "true", false),
+        ] {
+            let mut tasks = IndexMap::new();
+            let mut task = TaskDefinition {
+                action: Some(TaskAction {
+                    uses: Some(if uses_composite {
+                        "composite".into()
+                    } else {
+                        "shell".into()
+                    }),
+                    ..TaskAction::default()
+                }),
+                ..TaskDefinition::default()
+            };
+            task.composite_steps = vec![CompositeStep {
+                uses: runner.into(),
+                run: run.into(),
+                source_document: None,
+            }];
+            tasks.insert("check".into(), task);
+            assert!(
+                lower_composite_tasks(&tasks, "check", "default").is_err(),
+                "accepted invalid direct composite model: {runner} {run} / {uses_composite}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_adversarial_public_composite_sequences() {
+        let root = tempfile::tempdir().unwrap();
+
+        let mut with_path_field = lowered_valid(root.path());
+        with_path_field["finish"].action.as_mut().unwrap().cwd = Some("ignored".into());
+        assert!(lower_composite_tasks(&with_path_field, "finish", "default").is_err());
+
+        let mut changed_timeout = lowered_valid(root.path());
+        changed_timeout["finish"].job.as_mut().unwrap().timeout = Some("2s".into());
+        assert!(lower_composite_tasks(&changed_timeout, "finish", "default").is_err());
+    }
+
+    #[test]
+    fn forged_synthetic_child_id_cannot_override_parent_subject() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("must-not-run");
+        let forged_subject = format!(
+            "project:{}/task:other",
+            root.path().canonicalize().unwrap().display()
+        );
+        let grants = neoenv_policy::CapabilityGrants::from_toml(&format!(
+            "[[grants]]\nsubject = {forged_subject:?}\ncapability = 'execute'\n"
+        ))
+        .unwrap();
+        let mut tasks = lowered_valid(root.path());
+        tasks["finish"].execution_grant_required = true;
+        let command = format!("touch {}", marker.display());
+        tasks["finish"].composite_steps[0].run = command.clone();
+        let child = tasks["finish"]
+            .job
+            .as_mut()
+            .unwrap()
+            .tasks
+            .get_mut("composite-step-0")
+            .unwrap();
+        child.id = Some("other".into());
+        child.execution_grant_required = true;
+        child.action.as_mut().unwrap().run = Some(command);
+
+        let error = run_with_grants(root.path(), &tasks, &grants).unwrap_err();
+        assert!(error.to_string().contains("project:"));
+        assert!(error.to_string().contains("/task:finish"));
+        assert!(!error.to_string().contains("/task:other"));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn composite_steps_use_explicit_parent_identity_for_both_preflights() {
+        let root = tempfile::tempdir().unwrap();
+        let subject = format!(
+            "project:{}/task:stable-id",
+            root.path().canonicalize().unwrap().display()
+        );
+        let grants = neoenv_policy::CapabilityGrants::from_toml(&format!(
+            "[[grants]]\nsubject = {subject:?}\ncapability = 'execute'\n"
+        ))
+        .unwrap();
+        let mut tasks = lowered_valid(root.path());
+        let parent = tasks.get_mut("finish").unwrap();
+        parent.id = Some("stable-id".into());
+        parent.execution_grant_required = true;
+        parent
+            .job
+            .as_mut()
+            .unwrap()
+            .tasks
+            .get_mut("composite-step-0")
+            .unwrap()
+            .execution_grant_required = true;
+
+        let report = run_with_grants(root.path(), &tasks, &grants).unwrap();
+        assert_eq!(report.tasks.last().unwrap().outcome, TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn unreachable_invalid_composite_does_not_block_requested_task() {
+        let root = tempfile::tempdir().unwrap();
+        let mut tasks = lowered_valid(root.path());
+        let mut invalid = tasks["finish"].clone();
+        invalid.job = None;
+        invalid.composite_steps.clear();
+        tasks.insert("unrelated".into(), invalid);
+
+        let report = run_with_grants(root.path(), &tasks, &Default::default()).unwrap();
+        assert_eq!(report.tasks.last().unwrap().outcome, TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn unreachable_invalid_composite_inside_reachable_job_does_not_block() {
+        let root = tempfile::tempdir().unwrap();
+        let mut nested = lowered_valid(root.path());
+        let mut invalid = nested["finish"].clone();
+        invalid.job = None;
+        invalid.composite_steps.clear();
+        nested.insert("unrelated".into(), invalid);
+        let tasks = IndexMap::from([(
+            "finish".into(),
+            TaskDefinition {
+                job: Some(Box::new(neoenv_core::tasks::TaskSequence {
+                    tasks: nested,
+                    root: "finish".into(),
+                    context: "default".into(),
+                    timeout: None,
+                    kind: neoenv_core::tasks::TaskSequenceKind::Job,
+                })),
+                ..TaskDefinition::default()
+            },
+        )]);
+
+        let report = run_with_grants(root.path(), &tasks, &Default::default()).unwrap();
+        assert_eq!(report.tasks.last().unwrap().outcome, TaskOutcome::Succeeded);
+    }
+}
+
 fn required_run(action: &TaskAction) -> Result<&str, String> {
     action
         .run
@@ -1402,6 +1845,7 @@ fn required_run(action: &TaskAction) -> Result<&str, String> {
     reason = "the execution seam names every independent input explicitly"
 )]
 fn execute_task(
+    task_name: &str,
     task: &TaskDefinition,
     project_root: &Path,
     environment: &BTreeMap<String, String>,
@@ -1416,6 +1860,14 @@ fn execute_task(
     let options = &scope.options;
     let owned_background = scope.owned;
     if let Some(job) = &task.job {
+        if job.kind == neoenv_core::tasks::TaskSequenceKind::Composite
+            && job
+                .tasks
+                .values()
+                .any(|step| step.job.is_some() || !step.composite_steps.is_empty())
+        {
+            return Err("nested composite steps are unsupported".into());
+        }
         let timeout = job.timeout.as_deref().map(parse_timeout).transpose()?;
         let cancellation = options.cancellation.with_timeout(timeout)?;
         let values = environment
@@ -1428,6 +1880,14 @@ fn execute_task(
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect()
         });
+        let caller_subject = if job.kind == neoenv_core::tasks::TaskSequenceKind::Composite {
+            let root = project_root
+                .canonicalize()
+                .map_err(|_| "resolve project root for composite authorization".to_owned())?;
+            Some(caller_policy_subject(task, task_name, &root))
+        } else {
+            None
+        };
         let (report, handoff) = run_graph(
             &job.tasks,
             &job.root,
@@ -1439,6 +1899,7 @@ fn execute_task(
                 overrides: overrides.as_ref(),
             },
             &[],
+            caller_subject.as_deref(),
             ExecutionScope {
                 options: TaskRunOptions {
                     input_values: None,

@@ -18,6 +18,33 @@ A task's `uses:` can name a built-in runner instead of describing a command for
 `use:` is accepted as the legacy spelling of `uses:` for all of them, as it
 already was for every other runner.
 
+## `uses: composite`
+
+A composite task runs a non-empty ordered list of inline shell actions:
+
+```yaml
+tasks:
+  release:
+    uses: composite
+    timeout: 2m
+    steps:
+      - uses: shell
+        run: ./scripts/build.sh
+      - uses: shell
+        run: ./scripts/publish.sh
+```
+
+Steps run sequentially; a failed step prevents later steps from starting.
+Timeouts and cancellation apply to the whole sequence. The complete sequence is
+planned and capability-checked before its first effect. Imported package tasks
+use the same syntax, retain their package identity for authorization, and remain
+subject to the normal execution-trust check.
+
+Only `uses: shell` plus `run:` is currently supported in each step. Task
+references, nested composites, and path-bearing or otherwise unknown step
+fields are rejected. On the composite task itself, `cwd`, `env`, `dotenv`, and
+action arguments are rejected rather than ignored.
+
 ## Inline versus file
 
 The choice is explicit. Nothing infers file mode from a file extension.
@@ -298,13 +325,15 @@ executable is uv 0.8.0, and the receipt digest is not bound to the executable.
 
 Before these names existed, `uses: bash` meant "look for an executable named
 `bash` in the configured `task_dirs`". It now means the built-in target shell.
-The same applies to every name in the table above, plus `wsl`, `uv`, any
+The same applies to every name in the table above, plus `composite`, `wsl`, `uv`, any
 `uv@...` spelling, and any `tmpl://...` spelling. `templ` is not reserved,
 because the reference does not accept it as an alias.
 
 - A fallback executable with one of those names is **shadowed**. It is not
   reached through `uses:`. Rename the file and update the task, or call it
-  through `argv` with an explicit path.
+  through `argv` with an explicit path. In particular, migrate an executable
+  formerly named `composite` to another bare name and update `uses:`; if it is
+  in a global task directory, update its exact runner grant to the new name.
 - Unknown names still use the existing fallback: a bare file name is resolved
   inside a configured local or global `task_dirs` entry. A global fallback still
   requires an exact external `execute` grant for
