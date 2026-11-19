@@ -230,6 +230,38 @@ fn provider_lock(
     )
 }
 
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
+}
+
+fn fixture_executable(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        path.with_extension("exe")
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+#[test]
+fn toml_path_fixture_escapes_windows_separators_and_round_trips() {
+    let path = r"\\?\C:\Users\fixture\AppData\Local\Temp\provider.neoenv.lock";
+    let encoded = toml_string(path);
+    assert_eq!(
+        toml::from_str::<toml::Value>(&format!("path = {encoded}")).unwrap()["path"].as_str(),
+        Some(path)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn fixture_executable_uses_windows_executable_suffix() {
+    let path = fixture_executable(PathBuf::from(r"C:\tools\go\bin\go"));
+    assert_eq!(path.file_name().unwrap(), "go.exe");
+}
+
 fn provider_config(
     key: &str,
     lock: &Path,
@@ -240,8 +272,8 @@ fn provider_config(
     immutable: &str,
 ) -> String {
     format!(
-        "[global.providers.\"{key}\"]\nversion = \"{version}\"\nresolved_version = \"{version}\"\nsha256 = \"{sha}\"\ndigest = \"{sha}\"\nsource = \"{url}\"\nresolver = \"github-release\"\nimmutable_id = \"{immutable}\"\nlock_path = \"{}\"\nbinaries = [\"{binary}\"]\n",
-        lock.display()
+        "[global.providers.\"{key}\"]\nversion = \"{version}\"\nresolved_version = \"{version}\"\nsha256 = \"{sha}\"\ndigest = \"{sha}\"\nsource = \"{url}\"\nresolver = \"github-release\"\nimmutable_id = \"{immutable}\"\nlock_path = {}\nbinaries = [\"{binary}\"]\n",
+        toml_string(&lock.display().to_string())
     )
 }
 
@@ -259,7 +291,7 @@ fn cargo_provider_selects_only_its_binary_and_allows_an_unrelated_provider() {
     fs::create_dir_all(&system_config).unwrap();
     fs::create_dir_all(system_install.join("tools/go/1.22.0/go/bin")).unwrap();
     fs::write(
-        system_install.join("tools/go/1.22.0/go/bin/go"),
+        fixture_executable(system_install.join("tools/go/1.22.0/go/bin/go")),
         b"#!/bin/sh\n",
     )
     .unwrap();
@@ -300,8 +332,8 @@ fn cargo_provider_selects_only_its_binary_and_allows_an_unrelated_provider() {
         "unrelated-immutable",
     );
     let cargo_config = format!(
-        "[global.providers.\"cargo-ripgrep\"]\nversion = \"14.1.1\"\nresolved_version = \"14.1.1\"\nsha256 = \"{sha}\"\ndigest = \"{sha}\"\nsource = \"{cargo_url}\"\nresolver = \"cargo\"\nimmutable_id = \"{cargo_url}\"\nlock_path = \"{}\"\nbinaries = [\"rg\"]\n",
-        cargo_lock_path.display()
+        "[global.providers.\"cargo-ripgrep\"]\nversion = \"14.1.1\"\nresolved_version = \"14.1.1\"\nsha256 = \"{sha}\"\ndigest = \"{sha}\"\nsource = \"{cargo_url}\"\nresolver = \"cargo\"\nimmutable_id = \"{cargo_url}\"\nlock_path = {}\nbinaries = [\"rg\"]\n",
+        toml_string(&cargo_lock_path.display().to_string())
     );
     fs::write(
         user_config.join("neoenv/neoenv.toml"),
@@ -429,7 +461,7 @@ fn unrelated_valid_provider_does_not_block_a_working_runtime() {
     fs::create_dir_all(&system_config).unwrap();
     fs::create_dir_all(system_install.join("tools/go/1.22.0/go/bin")).unwrap();
     fs::write(
-        system_install.join("tools/go/1.22.0/go/bin/go"),
+        fixture_executable(system_install.join("tools/go/1.22.0/go/bin/go")),
         b"#!/bin/sh\n",
     )
     .unwrap();
@@ -515,7 +547,7 @@ fn present_non_string_provider_fields_are_named_and_fail_closed() {
     fs::create_dir_all(&system_config).unwrap();
     fs::create_dir_all(system_install.join("tools/go/1.22.0/go/bin")).unwrap();
     fs::write(
-        system_install.join("tools/go/1.22.0/go/bin/go"),
+        fixture_executable(system_install.join("tools/go/1.22.0/go/bin/go")),
         b"#!/bin/sh\n",
     )
     .unwrap();
@@ -594,7 +626,7 @@ fn stale_recorded_binaries_are_detected_before_fallback() {
     fs::create_dir_all(&system_config).unwrap();
     fs::create_dir_all(system_install.join("tools/go/1.22.0/go/bin")).unwrap();
     fs::write(
-        system_install.join("tools/go/1.22.0/go/bin/go"),
+        fixture_executable(system_install.join("tools/go/1.22.0/go/bin/go")),
         b"#!/bin/sh\n",
     )
     .unwrap();
@@ -657,7 +689,7 @@ fn cross_provider_lock_entry_is_rejected() {
     fs::create_dir_all(&system_config).unwrap();
     fs::create_dir_all(system_install.join("tools/go/1.22.0/go/bin")).unwrap();
     fs::write(
-        system_install.join("tools/go/1.22.0/go/bin/go"),
+        fixture_executable(system_install.join("tools/go/1.22.0/go/bin/go")),
         b"#!/bin/sh\n",
     )
     .unwrap();
@@ -872,7 +904,7 @@ fn selected_provider_with_missing_executable_does_not_fall_back() {
     fs::create_dir_all(&system_config).unwrap();
     fs::create_dir_all(system_install.join("tools/go/1.22.0/go/bin")).unwrap();
     fs::write(
-        system_install.join("tools/go/1.22.0/go/bin/go"),
+        fixture_executable(system_install.join("tools/go/1.22.0/go/bin/go")),
         b"#!/bin/sh\n",
     )
     .unwrap();
@@ -935,7 +967,7 @@ fn missing_binaries_recover_ownership_from_a_valid_unrelated_lock() {
     fs::create_dir_all(&system_config).unwrap();
     fs::create_dir_all(system_install.join("tools/go/1.22.0/go/bin")).unwrap();
     fs::write(
-        system_install.join("tools/go/1.22.0/go/bin/go"),
+        fixture_executable(system_install.join("tools/go/1.22.0/go/bin/go")),
         b"#!/bin/sh\n",
     )
     .unwrap();
@@ -961,8 +993,8 @@ fn missing_binaries_recover_ownership_from_a_valid_unrelated_lock() {
     fs::write(
         user_config.join("neoenv/neoenv.toml"),
         format!(
-            "[global.providers.\"gh:user/other\"]\nlock_path = \"{}\"\n",
-            lock.display()
+            "[global.providers.\"gh:user/other\"]\nlock_path = {}\n",
+            toml_string(&lock.display().to_string())
         ),
     )
     .unwrap();
@@ -1000,8 +1032,8 @@ fn missing_binaries_recover_a_claiming_selected_provider() {
     fs::write(
         user_config.join("neoenv/neoenv.toml"),
         format!(
-            "[global.providers.\"gh:user/selected\"]\nlock_path = \"{}\"\n",
-            lock.display()
+            "[global.providers.\"gh:user/selected\"]\nlock_path = {}\n",
+            toml_string(&lock.display().to_string())
         ),
     )
     .unwrap();
@@ -1027,7 +1059,7 @@ fn corrupt_user_provider_state_does_not_fall_back_to_system() {
     fs::create_dir_all(&system_config).unwrap();
     fs::create_dir_all(system_install.join("tools/go/1.22.0/go/bin")).unwrap();
     fs::write(
-        system_install.join("tools/go/1.22.0/go/bin/go"),
+        fixture_executable(system_install.join("tools/go/1.22.0/go/bin/go")),
         b"#!/bin/sh\n",
     )
     .unwrap();
@@ -1191,7 +1223,7 @@ fn tool_list_which_and_cleanup_honor_scope_without_cross_writes() {
     // A user-selected `go` is resolvable only in the user scope.
     fs::create_dir_all(user_data.join("neoenv/tools/go/1.22.0/go/bin")).unwrap();
     fs::write(
-        user_data.join("neoenv/tools/go/1.22.0/go/bin/go"),
+        fixture_executable(user_data.join("neoenv/tools/go/1.22.0/go/bin/go")),
         b"#!/bin/sh\n",
     )
     .unwrap();

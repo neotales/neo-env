@@ -6,7 +6,7 @@ use std::sync::{Condvar, Mutex};
 use std::{
     fs,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sha2::{Digest, Sha256};
@@ -227,10 +227,12 @@ impl ReleaseFixture {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         server_requests.fetch_add(1, Ordering::Relaxed);
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                        let mut request = [0_u8; 8192];
-                        let size = stream.read(&mut request).unwrap_or(0);
-                        let request = String::from_utf8_lossy(&request[..size]);
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                        let Ok(request) = read_fixture_headers(&mut stream, Duration::from_secs(2))
+                        else {
+                            continue;
+                        };
+                        let request = String::from_utf8_lossy(&request);
                         let path = request
                             .lines()
                             .next()
@@ -351,6 +353,46 @@ impl Drop for ReleaseFixture {
     }
 }
 
+// The deadline covers the entire header, not each individual read: a slow
+// client must not prevent fixture shutdown indefinitely.
+fn read_fixture_headers(stream: &mut TcpStream, timeout: Duration) -> std::io::Result<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "header deadline",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let count = match stream.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete headers",
+            ));
+        }
+        request.extend_from_slice(&buffer[..count]);
+        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            if end + 4 <= 8192 {
+                return Ok(request);
+            }
+        }
+        if request.len() >= 8192 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "headers too large",
+            ));
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 // This guard is the sole waiter for a fixture leader. It observes exit without
 // reaping, signals the owned process group while its ID cannot be recycled,
@@ -358,6 +400,9 @@ impl Drop for ReleaseFixture {
 // deliberately escapes the fixture's process group is not covered.
 struct OwnedChild {
     child: Option<std::process::Child>,
+    anchor: GroupAnchor,
+    signalled: bool,
+    reaped: Arc<AtomicBool>,
     stop_capture: Arc<AtomicBool>,
     stdout: Option<CaptureReader>,
     stderr: Option<CaptureReader>,
@@ -468,19 +513,105 @@ impl Spawnable for support::TestCommand {
     }
 }
 
+// Controlled fixture only: the anchor is our same-UID child, stays alive on
+// its stdin pipe, and never leaves its group. It keeps Darwin's group
+// signalable even when the command has already become a zombie.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct GroupAnchor(std::process::Child, Arc<AtomicBool>);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl GroupAnchor {
+    fn start(timeout: Duration) -> std::io::Result<Self> {
+        Self::start_script("printf R; exec cat >/dev/null", timeout)
+    }
+
+    fn start_script(script: &str, timeout: Duration) -> std::io::Result<Self> {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let child = Command::new("sh")
+            .args(["-c", script])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut anchor = Self(child, Arc::new(AtomicBool::new(false)));
+        let stdout = anchor.0.stdout.as_mut().unwrap();
+        let flags = OFlag::from_bits_truncate(fcntl(&*stdout, FcntlArg::F_GETFL)?);
+        fcntl(&*stdout, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut byte = [0];
+            match stdout.read(&mut byte) {
+                Ok(1) if byte[0] == b'R' => return Ok(anchor),
+                Ok(_) => return Err(std::io::Error::other("anchor readiness failed")),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "anchor readiness timed out",
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reap_bounded(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for GroupAnchor {
+    fn drop(&mut self) {
+        // Direct child identity remains owned even if command ownership was lost.
+        let _ = self.0.kill();
+        if matches!(
+            reap_bounded(&mut self.0, Duration::from_secs(2)),
+            Ok(Some(_))
+        ) {
+            self.1.store(true, Ordering::Release);
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl OwnedChild {
     fn spawn(command: &mut impl Spawnable) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
+        let anchor = GroupAnchor::start(Duration::from_secs(5))?;
+        let group = i32::try_from(anchor.0.id())
+            .map_err(|_| std::io::Error::other("invalid anchor pid"))?;
         let child = command
             .builder()
-            .process_group(0)
+            .process_group(group)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
         let mut owned = Self {
             child: Some(child),
+            anchor,
+            signalled: false,
+            reaped: Arc::new(AtomicBool::new(false)),
             stop_capture: Arc::new(AtomicBool::new(false)),
             stdout: None,
             stderr: None,
@@ -503,9 +634,12 @@ impl OwnedChild {
     }
 
     fn exited_without_reaping(&self) -> std::io::Result<bool> {
+        Self::is_exited(self.id())
+    }
+
+    fn is_exited(id: u32) -> std::io::Result<bool> {
         use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
-        let raw =
-            i32::try_from(self.id()).map_err(|_| std::io::Error::other("invalid child pid"))?;
+        let raw = i32::try_from(id).map_err(|_| std::io::Error::other("invalid child pid"))?;
         let pid = Pid::from_raw(raw).ok_or_else(|| std::io::Error::other("invalid child pid"))?;
         loop {
             match waitid(
@@ -533,39 +667,80 @@ impl OwnedChild {
     }
 
     fn terminate(&mut self) -> std::io::Result<()> {
-        use nix::errno::Errno;
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-        if self.child.is_some() {
-            // waitid(WNOWAIT) confirms the leader is still our unreaped child.
-            // This guard is its sole waiter, so its PID cannot be recycled
-            // before killpg, even if it exited.
-            let exited = self.exited_without_reaping()?;
-            let pid =
-                i32::try_from(self.id()).map_err(|_| std::io::Error::other("invalid child pid"))?;
-            match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
-                Ok(()) => {}
-                Err(Errno::ESRCH) if exited => {}
-                Err(error) => {
-                    // The group vanished while its leader was live, or could
-                    // not be signalled. Reap our still-owned leader, but do
-                    // not claim that escaped descendants were cleaned up.
-                    let child = self.child.as_mut().unwrap();
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    self.child.take();
-                    return Err(std::io::Error::other(format!(
-                        "owned process group cleanup failed: {error}"
-                    )));
-                }
-            }
+        self.terminate_with(|pid| {
+            nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .map_err(std::io::Error::from)
+        })
+    }
+
+    // Injectable signal operation tests failures without touching foreign PIDs.
+    fn terminate_with(
+        &mut self,
+        signal: impl FnOnce(i32) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        self.terminate_with_signals(signal, std::process::Child::kill)
+    }
+
+    fn terminate_with_signals(
+        &mut self,
+        signal: impl FnOnce(i32) -> std::io::Result<()>,
+        direct_signal: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.child.is_none() || self.signalled {
+            return Ok(());
         }
+        self.exited_without_reaping()?;
+        let anchor_live = !Self::is_exited(self.anchor.0.id())?;
+        let result = if anchor_live {
+            let pid = i32::try_from(self.anchor.0.id())
+                .map_err(|_| std::io::Error::other("invalid anchor pid"))?;
+            signal(pid)
+        } else {
+            Err(std::io::Error::other("owned process group anchor exited"))
+        };
+        if let Err(error) = result {
+            // Only the verified, unreaped command handle may be signalled here.
+            // Never replace the original group-signal error with a cleanup error.
+            let child = self.child.as_mut().unwrap();
+            let _kill_result = direct_signal(child);
+            if matches!(reap_bounded(child, Duration::from_secs(2)), Ok(Some(_))) {
+                self.reaped.store(true, Ordering::Release);
+                self.child.take();
+            }
+            // Keep an unreaped handle so Drop can retry without a PID lookup.
+            return Err(error);
+        }
+        // A successful killpg may have reached only the anchor. Independently
+        // confirm the command exited before any reaping or blocking wait.
+        if !self.wait_until_exit(Duration::from_secs(2))? {
+            let child = self.child.as_mut().unwrap();
+            let kill_result = direct_signal(child);
+            if matches!(reap_bounded(child, Duration::from_secs(2)), Ok(Some(_))) {
+                self.reaped.store(true, Ordering::Release);
+                self.child.take();
+            }
+            // If it remains alive, retain the owned handle for Drop to retry
+            // cleanup; never turn a direct signal error into a timeout.
+            kill_result?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "command survived group signal",
+            ));
+        }
+        self.signalled = true;
         Ok(())
     }
 
     fn output(mut self) -> std::io::Result<std::process::Output> {
         self.terminate()?;
-        let status = self.child.as_mut().unwrap().wait()?;
+        let status = reap_bounded(self.child.as_mut().unwrap(), Duration::from_secs(2))?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "command reap timed out")
+            })?;
+        self.reaped.store(true, Ordering::Release);
         self.child.take();
         self.stop_capture.store(true, Ordering::Release);
         let stdout = self.stdout.take().unwrap().finish()?;
@@ -603,7 +778,9 @@ impl Drop for OwnedChild {
             if self.terminate().is_ok()
                 && let Some(child) = self.child.as_mut()
             {
-                let _ = child.wait();
+                if matches!(reap_bounded(child, Duration::from_secs(2)), Ok(Some(_))) {
+                    self.reaped.store(true, Ordering::Release);
+                }
             }
             self.child.take();
         }
@@ -1686,97 +1863,91 @@ fn noisy_runaway_capture_stays_bounded() {
     assert!(error.contains("[output truncated]"), "{error}");
 }
 
-#[cfg(target_os = "linux")]
-fn fixture_process_is_running(pid: u32) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .is_some_and(|state| state != "Z" && state != "X")
-}
-
-#[cfg(target_os = "linux")]
-fn exercise_exited_leader_cleanup(drop_guard: bool) {
-    let directory = tempfile::tempdir().unwrap();
-    let gate = directory.path().join("keep-running");
-    let ready = directory.path().join("ready");
-    fs::write(&gate, b"fixture").unwrap();
-    let mut command = Command::new("sh");
-    command.args([
-        "-c",
-        &format!(
-            "(printf ready > '{}'; while [ -e '{}' ]; do printf x; sleep 0.05; done) & echo $! >&2; while [ ! -e '{}' ]; do :; done; exit 0",
-            ready.display(), gate.display(), ready.display()
-        ),
-    ]);
-    let child = OwnedChild::spawn(&mut command).unwrap();
-    assert!(
-        child.wait_until_exit(Duration::from_secs(5)).unwrap(),
-        "fixture leader did not exit"
-    );
-    let pid_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let pid = loop {
-        let bytes = child
-            .stderr
-            .as_ref()
-            .unwrap()
-            .state
-            .lock()
-            .unwrap()
-            .bytes
-            .clone();
-        if let Ok(text) = std::str::from_utf8(&bytes)
-            && text.ends_with('\n')
-            && let Ok(pid) = text.trim().parse::<u32>()
-        {
-            break pid;
-        }
-        assert!(
-            std::time::Instant::now() < pid_deadline,
-            "writer PID not captured"
-        );
-        thread::sleep(Duration::from_millis(5));
-    };
-    assert!(
-        fixture_process_is_running(pid),
-        "writer must remain alive after its leader exits"
-    );
-    let capture = Arc::clone(&child.stdout.as_ref().unwrap().state);
-    if drop_guard {
-        drop(child);
-    } else {
-        let output = child.finish(Duration::from_secs(5)).unwrap();
-        assert_eq!(
-            String::from_utf8(output.stderr).unwrap().trim(),
-            pid.to_string()
-        );
-    }
-    assert!(ready.exists(), "writer must start before leader exits");
-    assert_eq!(Arc::strong_count(&capture), 1, "capture reader must stop");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while fixture_process_is_running(pid) && std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let still_running = fixture_process_is_running(pid);
-    // Clean up the old implementation's writer even if the assertion fails.
-    fs::remove_file(&gate).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while fixture_process_is_running(pid) && std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        !fixture_process_is_running(pid),
-        "fixture writer did not stop"
-    );
-    assert!(!still_running, "leader exit left a writer descendant alive");
-}
-
-#[cfg(target_os = "linux")]
+// The descendant lives until group cleanup or a release/EOF on the control
+// socket. Dropping the test's socket also releases it on panic; there is no
+// natural-exit timer that can masquerade as successful group cleanup.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn exited_leader_does_not_leave_writer_descendant() {
-    exercise_exited_leader_cleanup(false);
-    exercise_exited_leader_cleanup(true);
+    for drop_guard in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            r#"import os,socket,sys
+r,w=os.pipe()
+if os.fork()==0:
+ os.close(r)
+ s=socket.create_connection(('127.0.0.1',int(sys.argv[1])))
+ os.write(w,b'R'); os.close(w)
+ while True:
+  msg=s.recv(1)
+  if msg!=b'P': break
+  s.sendall(b'P')
+ s.close()
+ os._exit(0)
+os.close(w)
+assert os.read(r,1)==b'R'
+os._exit(0)
+"#,
+            &port,
+        ]);
+        let child = OwnedChild::spawn(&mut command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) => panic!("descendant did not connect: {e}"),
+            }
+        };
+        assert!(child.wait_until_exit(Duration::from_secs(5)).unwrap());
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut byte = [0];
+        // The handshake proves that the descendant is alive immediately
+        // before cleanup, and its only normal exit requires our release.
+        stream.write_all(b"P").unwrap();
+        stream.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"P");
+        let reaped = Arc::clone(&child.reaped);
+        let result = if drop_guard {
+            drop(child);
+            Ok(())
+        } else {
+            child.finish(Duration::from_secs(5)).and_then(|output| {
+                output
+                    .status
+                    .success()
+                    .then_some(())
+                    .ok_or_else(|| format!("command exited with {}", output.status))
+            })
+        };
+        // Record whether EOF occurred *before* release. Even on timeout or
+        // fixture failure, release and close the socket before asserting.
+        let before_release = stream.read(&mut byte);
+        let _ = stream.write_all(b"R");
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let released = if matches!(before_release, Ok(0)) {
+            Ok(0)
+        } else {
+            stream.read(&mut byte)
+        };
+        assert!(matches!(released, Ok(0)), "release failed: {released:?}");
+        assert!(result.is_ok(), "fixture cleanup failed: {result:?}");
+        assert!(reaped.load(Ordering::Acquire));
+        assert!(
+            matches!(before_release, Ok(0)),
+            "descendant survived group cleanup: {before_release:?}"
+        );
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1785,21 +1956,177 @@ fn already_reaped_leader_refuses_process_group_signal() {
     let mut command = Command::new("sh");
     command.args(["-c", "exit 0"]);
     let mut child = OwnedChild::spawn(&mut command).unwrap();
-    assert!(child.child.as_mut().unwrap().wait().unwrap().success());
+    assert!(child.wait_until_exit(Duration::from_secs(5)).unwrap());
+    assert!(
+        child
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .unwrap()
+            .success()
+    );
     let error = child
         .terminate()
         .expect_err("reaped leader must not authorize a group signal");
     assert_eq!(error.raw_os_error(), Some(nix::errno::Errno::ECHILD as i32));
+    let anchor_reaped = Arc::clone(&child.anchor.1);
+    drop(child);
+    assert!(anchor_reaped.load(Ordering::Acquire));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn anchor_readiness_is_bounded_and_exited_command_is_preserved() {
+    let start = Instant::now();
+    let error = match GroupAnchor::start_script("exec sleep 30", Duration::from_millis(100)) {
+        Ok(_) => panic!("silent anchor must time out"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    let mut command = Command::new("sh");
+    command.args(["-c", "exit 23"]);
+    let child = OwnedChild::spawn(&mut command).unwrap();
+    let anchor_reaped = Arc::clone(&child.anchor.1);
+    assert!(child.wait_until_exit(Duration::from_secs(5)).unwrap());
+    let output = child.finish(Duration::from_secs(5)).unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    assert!(anchor_reaped.load(Ordering::Acquire));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn failed_or_partial_group_signal_is_bounded_and_reported() {
+    for partial in [false, true] {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let mut child = OwnedChild::spawn(&mut command).unwrap();
+        let reaped = Arc::clone(&child.reaped);
+        let anchor_reaped = Arc::clone(&child.anchor.1);
+        let start = Instant::now();
+        let error = child
+            .terminate_with(|_| {
+                if partial {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::from_raw_os_error(
+                        nix::errno::Errno::EPERM as i32,
+                    ))
+                }
+            })
+            .unwrap_err();
+        if partial {
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        } else {
+            assert_eq!(error.raw_os_error(), Some(nix::errno::Errno::EPERM as i32));
+        }
+        drop(child);
+        assert!(start.elapsed() < Duration::from_secs(8));
+        assert!(reaped.load(Ordering::Acquire));
+        assert!(anchor_reaped.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn direct_signal_failure_after_partial_group_signal_is_reported() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "exec sleep 30"]);
+    let mut child = OwnedChild::spawn(&mut command).unwrap();
+    let reaped = Arc::clone(&child.reaped);
+    let anchor_reaped = Arc::clone(&child.anchor.1);
+    let start = Instant::now();
+    let error = child
+        .terminate_with_signals(
+            |_| Ok(()),
+            |_| {
+                Err(std::io::Error::from_raw_os_error(
+                    nix::errno::Errno::EPERM as i32,
+                ))
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(nix::errno::Errno::EPERM as i32));
+    assert!(child.child.is_some(), "retain the owned child for cleanup");
+    drop(child);
+    assert!(start.elapsed() < Duration::from_secs(8));
+    assert!(reaped.load(Ordering::Acquire));
+    assert!(anchor_reaped.load(Ordering::Acquire));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn failed_group_and_direct_signal_retains_child_for_drop_retry() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "exec sleep 30"]);
+    let mut child = OwnedChild::spawn(&mut command).unwrap();
+    let reaped = Arc::clone(&child.reaped);
+    let anchor_reaped = Arc::clone(&child.anchor.1);
+    let start = Instant::now();
+    let error = child
+        .terminate_with_signals(
+            |_| {
+                Err(std::io::Error::from_raw_os_error(
+                    nix::errno::Errno::EPERM as i32,
+                ))
+            },
+            |_| {
+                Err(std::io::Error::from_raw_os_error(
+                    nix::errno::Errno::EACCES as i32,
+                ))
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(nix::errno::Errno::EPERM as i32));
+    assert!(child.child.is_some(), "unreaped child must be retained");
+    assert!(!reaped.load(Ordering::Acquire));
+    drop(child);
+    assert!(start.elapsed() < Duration::from_secs(8));
+    assert!(reaped.load(Ordering::Acquire));
+    assert!(anchor_reaped.load(Ordering::Acquire));
+}
+
+#[test]
+fn fixture_headers_handle_fragments_and_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let writer = thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.write_all(b"GET /frag HTTP/1.1\r\nHost:").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        stream.write_all(b" localhost\r\n\r\n").unwrap();
+    });
+    let (mut stream, _) = listener.accept().unwrap();
+    assert!(
+        read_fixture_headers(&mut stream, Duration::from_secs(2))
+            .unwrap()
+            .ends_with(b"\r\n\r\n")
+    );
+    writer.join().unwrap();
+
+    let writer = thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).unwrap();
+        let _ = stream.write_all(&vec![b'x'; 9000]);
+    });
+    let (mut stream, _) = listener.accept().unwrap();
+    assert_eq!(
+        read_fixture_headers(&mut stream, Duration::from_secs(2))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    writer.join().unwrap();
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn hung_exec_worker_is_bounded_and_reaped() {
-    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
     let mut command = Command::new("sh");
     command.args(["-c", "printf fixture-start; exec sleep 30"]);
     let child = OwnedChild::spawn(&mut command).unwrap();
-    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+    let reaped = Arc::clone(&child.reaped);
     let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
     while child.stdout.as_ref().unwrap().state.lock().unwrap().bytes != b"fixture-start" {
         assert!(
@@ -1813,7 +2140,7 @@ fn hung_exec_worker_is_bounded_and_reaped() {
     assert!(error.contains("timed out"), "{error}");
     assert!(error.contains("fixture-start"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(5));
-    assert_eq!(kill(pid, None), Err(Errno::ESRCH), "child must be reaped");
+    assert!(reaped.load(Ordering::Acquire), "child must be reaped");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1839,31 +2166,29 @@ fn captured_failure_output_is_bounded_without_pipe_deadlock() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn exec_worker_guard_reaps_child_during_panic() {
-    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
     let stop = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = std::sync::mpsc::channel();
     let handle = thread::spawn(move || {
         let mut command = Command::new("sh");
         command.args(["-c", "exec sleep 30"]);
         let child = OwnedChild::spawn(&mut command).unwrap();
-        sender.send(child.id()).unwrap();
+        sender.send(Arc::clone(&child.reaped)).unwrap();
         let _ = child.finish(Duration::from_millis(200));
     });
     let started = std::time::Instant::now();
-    let mut pid = None;
+    let mut reaped = None;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _worker = ExecWorker {
             stop,
             handle: Some(handle),
         };
-        pid = Some(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        reaped = Some(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
         panic!("fixture assertion failure");
     }));
     assert!(result.is_err());
     assert!(started.elapsed() < Duration::from_secs(5));
-    assert_eq!(
-        kill(Pid::from_raw(i32::try_from(pid.unwrap()).unwrap()), None),
-        Err(Errno::ESRCH),
+    assert!(
+        reaped.unwrap().load(Ordering::Acquire),
         "worker child must be reaped during unwind"
     );
 }
