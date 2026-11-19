@@ -38,6 +38,90 @@ use super::{
     tag_binding_path, tag_metadata_for,
 };
 
+#[cfg(windows)]
+#[test]
+fn windows_git_init_compares_canonical_and_native_staging_paths() {
+    // Exercise the production runner and options, including the hostile
+    // configuration environment, without printing Git's untrusted stderr.
+    fn run(path: &Path) -> (bool, &'static str) {
+        let mut command = Command::new("git");
+        command
+            .args(super::git_options())
+            .arg("init")
+            .arg(path)
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "url.https://127.0.0.1:9/.insteadOf")
+            .env("GIT_CONFIG_VALUE_0", "fixture-origin")
+            .env("GIT_CONFIG_KEY_1", "url.ssh://127.0.0.1:9/.insteadOf")
+            .env("GIT_CONFIG_VALUE_1", "fixture-origin")
+            .env(
+                "GIT_CONFIG_PARAMETERS",
+                "'url.https://127.0.0.1:9/.insteadOf'='fixture-origin'",
+            );
+        let output = match super::run_git_output(&mut command, None) {
+            Ok(output) => output,
+            Err(error) => {
+                let category = match error {
+                    RemoteError::IoSource { .. } | RemoteError::Io(_) => "runner-io-error",
+                    RemoteError::PolicySource { .. } | RemoteError::InvalidPolicy(_) => {
+                        "runner-policy-error"
+                    }
+                    RemoteError::Cancelled => "runner-cancelled",
+                    RemoteError::Git(_) => "runner-git-error",
+                    _ => "runner-other-error",
+                };
+                return (false, category);
+            }
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        let kind = if stderr.contains("filename too long") || stderr.contains("path too long") {
+            "path-too-long"
+        } else if stderr.contains("invalid argument") || stderr.contains("invalid path") {
+            "invalid-path-or-argument"
+        } else if stderr.contains("permission denied") || stderr.contains("access is denied") {
+            "permission-denied"
+        } else if stderr.contains("no such file or directory") {
+            "not-found"
+        } else if stderr.contains("config") {
+            "configuration"
+        } else {
+            "other-or-empty"
+        };
+        (output.status.success(), kind)
+    }
+
+    let root = TempDir::new().unwrap();
+    let project = root.path().join("project");
+    let parent = project.join(".neoenv/modules/commits").join("a".repeat(64));
+    fs::create_dir_all(&parent).unwrap();
+    let native = tempfile::Builder::new()
+        .prefix("neoenv-module-")
+        .tempdir_in(&parent)
+        .unwrap();
+    let canonical_parent = parent.canonicalize().unwrap();
+    let canonical = tempfile::Builder::new()
+        .prefix("neoenv-module-")
+        .tempdir_in(&canonical_parent)
+        .unwrap();
+    let native_path = native.path().join("source");
+    let canonical_path = canonical.path().join("source");
+    let native_result = run(&native_path);
+    let canonical_result = run(&canonical_path);
+    println!(
+        "Git init diagnostic: native={native_result:?} canonical={canonical_result:?}; \
+         native_len={} canonical_len={}",
+        native_path.as_os_str().len(),
+        canonical_path.as_os_str().len()
+    );
+    assert!(
+        native_result.0 && canonical_result.0,
+        "Git init failed: native={native_result:?} canonical={canonical_result:?}; \
+         native_len={} canonical_len={}",
+        native_path.as_os_str().len(),
+        canonical_path.as_os_str().len()
+    );
+}
+
 #[test]
 fn io_source_survives_the_remote_error_boundary() {
     let directory = TempDir::new().unwrap();

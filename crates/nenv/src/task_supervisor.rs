@@ -813,4 +813,128 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+
+    // This is evidence about Darwin, not an alternate cleanup policy. The
+    // helper is independently timed out and only its direct child is killed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_waitable_group_signal_diagnostic() {
+        // Unlike the production guard, this guard never signals a group.
+        // Every failure path still owns and reaps its direct child.
+        struct ProbeChild(Option<Child>);
+
+        impl Drop for ProbeChild {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        const FLAG: &str = "NEOENV_DARWIN_GROUP_DIAGNOSTIC";
+        if std::env::var_os(FLAG).is_none() {
+            let helper = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "task_supervisor::tests::darwin_waitable_group_signal_diagnostic",
+                    "--nocapture",
+                ])
+                .env(FLAG, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut helper = ProbeChild(Some(helper));
+            // Read at most 4 KiB per stream; closing a full pipe also keeps
+            // a malfunctioning helper from producing unbounded CI logs.
+            let capture = |stream: Box<dyn Read + Send>| {
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let _ = stream.take(4096).read_to_end(&mut bytes);
+                    bytes
+                })
+            };
+            let stdout = capture(Box::new(helper.0.as_mut().unwrap().stdout.take().unwrap()));
+            let stderr = capture(Box::new(helper.0.as_mut().unwrap().stderr.take().unwrap()));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = helper.0.as_mut().unwrap().try_wait().unwrap() {
+                    helper.0.take();
+                    eprintln!("{}", String::from_utf8_lossy(&stdout.join().unwrap()));
+                    eprintln!("{}", String::from_utf8_lossy(&stderr.join().unwrap()));
+                    assert!(
+                        status.success(),
+                        "Darwin diagnostic helper failed: {status}"
+                    );
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    // Never signal a potentially recycled group or descendant PID.
+                    drop(helper);
+                    eprintln!("{}", String::from_utf8_lossy(&stdout.join().unwrap()));
+                    eprintln!("{}", String::from_utf8_lossy(&stderr.join().unwrap()));
+                    panic!("Darwin diagnostic helper timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        for with_descendant in [false, true] {
+            let (mut ready, writer) = UnixStream::pair().unwrap();
+            ready
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let script = if with_descendant {
+                // The descendant signals readiness itself, then expires even if
+                // the helper is killed or the group signal fails. No ps output
+                // or unbounded input is captured.
+                "(printf R; exec sleep 8) & exit 7"
+            } else {
+                "exit 7"
+            };
+            let child = Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut child = ProbeChild(Some(child));
+            if with_descendant {
+                let mut byte = [0];
+                ready
+                    .read_exact(&mut byte)
+                    .expect("descendant readiness timed out");
+                assert_eq!(byte, *b"R");
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let observed = loop {
+                let status = waitid(
+                    WaitId::Pid(ChildPid::from_child(child.0.as_ref().unwrap())),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                )
+                .unwrap();
+                if let Some(status) = status {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "leader did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            // The waitable, unreaped leader reserves this group identity. This
+            // one signal is the subject of the probe, not a cleanup retry.
+            let group = i32::try_from(child.0.as_ref().unwrap().id()).unwrap();
+            let signal = kill(Pid::from_raw(-group), Signal::SIGKILL);
+            eprintln!(
+                "Darwin group diagnostic: descendant_ready={with_descendant} leader_exited={} signal={signal:?}",
+                observed.exited()
+            );
+            // After the observation, only reap our direct child. On failure a
+            // descendant expires naturally; never retry using an unpinned PID.
+            child.0.as_mut().unwrap().wait().unwrap();
+            child.0.take();
+        }
+    }
 }

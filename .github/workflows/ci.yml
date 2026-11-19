@@ -63,6 +63,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Diagnose Darwin group signals
+        if: runner.os == 'macOS'
+        run: cargo test -p nenv --locked task_supervisor::tests::darwin_waitable_group_signal_diagnostic -- --exact --nocapture
+
+      - name: Diagnose Windows Git initialization
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p neoenv-runtime windows_git_init_compares_canonical_and_native_staging_paths -- --nocapture
+
       - name: Test
         run: cargo test --workspace --locked
         env:
