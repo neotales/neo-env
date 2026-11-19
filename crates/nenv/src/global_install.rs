@@ -18,12 +18,12 @@ use super::{
     install_go_sdk_with_progress, install_java_runtime_with_progress, install_locked_tools_in,
     install_node_runtime_with_progress, install_odin_runtime_with_progress,
     install_python_runtime_with_progress, install_rust_runtime_with_progress,
-    install_uv_runtime_with_progress, install_zig_runtime_with_progress, mpsc, neoenv_directory,
-    panic, read_lockfile, read_text_file, resolve_bun_runtime, resolve_deno_runtime,
-    resolve_dotnet_sdk, resolve_go_sdk, resolve_java_runtime, resolve_node_runtime,
-    resolve_odin_runtime, resolve_python_runtime, resolve_rust_runtime, resolve_tools,
-    resolve_uv_runtime, resolve_zig_runtime, state_file, system_directory, thread, tool_states_in,
-    verify_lockfile, write_lockfile,
+    install_uv_runtime_with_progress, install_zig_runtime_with_progress, mpsc, panic,
+    read_lockfile, read_text_file, resolve_bun_runtime, resolve_deno_runtime, resolve_dotnet_sdk,
+    resolve_go_sdk, resolve_java_runtime, resolve_node_runtime, resolve_odin_runtime,
+    resolve_python_runtime, resolve_rust_runtime, resolve_tools, resolve_uv_runtime,
+    resolve_zig_runtime, state_file, system_directory, thread, tool_states_in, verify_lockfile,
+    write_lockfile,
 };
 
 #[derive(Debug)]
@@ -560,10 +560,21 @@ pub(super) struct GlobalLayout {
 impl GlobalLayout {
     pub(super) fn resolve(scope: GlobalScope) -> Result<Self, Diagnostic> {
         let (config_dir, data_root) = match scope {
-            GlobalScope::User => (
-                neoenv_directory(UserDirectory::Config),
-                neoenv_directory(UserDirectory::Data),
-            ),
+            GlobalScope::User => {
+                let config_root = neoenv_runtime::paths::user_directory(UserDirectory::Config);
+                let data_root = neoenv_runtime::paths::user_directory(UserDirectory::Data);
+                // Validate the configured roots before joining the product-owned
+                // directory. On Windows, metadata("file\\neoenv") reports
+                // NotFound (rather than NotADirectory), which would otherwise
+                // make an invalid root look like an absent optional directory.
+                for root in [&config_root, &data_root].into_iter().flatten() {
+                    validate_user_root_directory(root)?;
+                }
+                (
+                    config_root.map(|root| root.join(neoenv_core::names::USER_DIRECTORY)),
+                    data_root.map(|root| root.join(neoenv_core::names::USER_DIRECTORY)),
+                )
+            }
             GlobalScope::System => (
                 system_directory(neoenv_runtime::paths::SystemDirectory::Config),
                 system_directory(neoenv_runtime::paths::SystemDirectory::Install),
@@ -716,6 +727,31 @@ fn validate_regular_directory(path: &Path) -> Result<(), Diagnostic> {
             "NEO522",
             format!(
                 "failed to inspect nenv directory {}: {error}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+/// Validate a user-selected XDG root while following a root symlink.
+///
+/// Configured roots may intentionally point through a symlink, but must resolve
+/// to a directory. A missing root remains valid because read-only lookup need
+/// not create the user's directory tree.
+fn validate_user_root_directory(path: &Path) -> Result<(), Diagnostic> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(Diagnostic::new(
+            DiagnosticCategory::Runtime,
+            "NEO522",
+            format!("configured user root {} is not a directory", path.display()),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Diagnostic::new(
+            DiagnosticCategory::Runtime,
+            "NEO522",
+            format!(
+                "failed to inspect configured user root {}: {error}",
                 path.display()
             ),
         )),

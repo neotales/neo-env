@@ -227,7 +227,7 @@ impl ReleaseFixture {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         server_requests.fetch_add(1, Ordering::Relaxed);
-                        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                        configure_fixture_stream(&stream).unwrap();
                         let Ok(request) = read_fixture_headers(&mut stream, Duration::from_secs(2))
                         else {
                             continue;
@@ -350,6 +350,82 @@ impl Drop for ReleaseFixture {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+// Darwin can inherit O_NONBLOCK from the listener; timeouts alone do not
+// make a nonblocking socket wait. Both fixture protocols use bounded I/O.
+fn configure_fixture_stream(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))
+}
+
+#[test]
+fn fixture_streams_wait_for_delayed_http_and_control_messages() {
+    for http in [true, false] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        // Simulate the accepted-socket mode Darwin can inherit even on Linux.
+        stream.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            stream.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        configure_fixture_stream(&stream).unwrap();
+        assert!(stream.read_timeout().unwrap().is_some());
+        assert!(stream.write_timeout().unwrap().is_some());
+        // On Unix the same error kind can mean either EAGAIN from a
+        // nonblocking socket or a receive timeout. Inspect the actual flag
+        // too, so scheduler delays cannot make a nonblocking mutation pass.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+            let flags = OFlag::from_bits_truncate(fcntl(&stream, FcntlArg::F_GETFL).unwrap());
+            assert!(!flags.contains(OFlag::O_NONBLOCK));
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let started = Instant::now();
+        let error = stream.read(&mut byte).unwrap_err();
+        #[cfg(windows)]
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        #[cfg(not(windows))]
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected empty-socket read error: {error}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "empty socket returned immediately: {error}"
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            client
+                .write_all(if http {
+                    b"GET / HTTP/1.1\r\n\r\n"
+                } else {
+                    b"P"
+                })
+                .unwrap();
+        });
+        if http {
+            let request = read_fixture_headers(&mut stream, Duration::from_secs(2)).unwrap();
+            assert_eq!(request, b"GET / HTTP/1.1\r\n\r\n");
+        } else {
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"P");
+        }
+        writer.join().unwrap();
     }
 }
 
@@ -1907,10 +1983,8 @@ os._exit(0)
                 Err(e) => panic!("descendant did not connect: {e}"),
             }
         };
+        configure_fixture_stream(&stream).unwrap();
         assert!(child.wait_until_exit(Duration::from_secs(5)).unwrap());
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
         let mut byte = [0];
         // The handshake proves that the descendant is alive immediately
         // before cleanup, and its only normal exit requires our release.

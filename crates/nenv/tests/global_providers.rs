@@ -1258,13 +1258,130 @@ fn invalid_user_layout_is_reported_instead_of_falling_back_to_system() {
         directory.path().join("system-config"),
     )
     .env("NEOENV_GLOBAL_INSTALL_DIR", &system_install)
-    .args(["tool", "which", "--user", "go"])
+    .args(["--format", "json", "tool", "which", "--user", "go"])
     .output()
     .unwrap();
     assert!(!output.status.success(), "{output:?}");
-    let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("user-config"), "{error}");
-    assert!(!error.contains("system"), "{error}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(document["diagnostic"]["code"], "NEO522", "{document}");
+    assert!(
+        document["diagnostic"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&user_config.to_string_lossy().to_string()),
+        "{document}"
+    );
+    assert!(!document.to_string().contains("system"), "{document}");
+}
+
+#[test]
+fn invalid_user_data_root_is_reported_as_a_layout_error() {
+    let directory = secure_temp_dir();
+    let user_config = directory.path().join("user-config");
+    let user_data = directory.path().join("user-data");
+    fs::create_dir(&user_config).unwrap();
+    fs::write(&user_data, b"not a directory").unwrap();
+    let output = global_command(directory.path(), &user_config, &user_data)
+        .env(
+            "NEOENV_GLOBAL_CONFIG_DIR",
+            directory.path().join("system-config"),
+        )
+        .env(
+            "NEOENV_GLOBAL_INSTALL_DIR",
+            directory.path().join("system-install"),
+        )
+        .args(["--format", "json", "tool", "which", "--user", "go"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(document["diagnostic"]["code"], "NEO522", "{document}");
+    assert!(
+        document["diagnostic"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&user_data.to_string_lossy().to_string()),
+        "{document}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn user_root_inspection_errors_retain_the_path_and_io_cause() {
+    let directory = secure_temp_dir();
+    let user_config = PathBuf::from(format!("/{}", "x".repeat(4096)));
+    let user_data = directory.path().join("user-data");
+    fs::create_dir(&user_data).unwrap();
+    let output = global_command(directory.path(), &user_config, &user_data)
+        .env(
+            "NEOENV_GLOBAL_CONFIG_DIR",
+            directory.path().join("system-config"),
+        )
+        .env(
+            "NEOENV_GLOBAL_INSTALL_DIR",
+            directory.path().join("system-install"),
+        )
+        .args(["--format", "json", "tool", "which", "--user", "go"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(document["diagnostic"]["code"], "NEO522", "{document}");
+    let diagnostic = document["diagnostic"]["message"].as_str().unwrap();
+    assert!(diagnostic.contains(&user_config.to_string_lossy().to_string()));
+    assert!(diagnostic.contains("File name too long"), "{diagnostic}");
+}
+
+#[test]
+fn missing_user_roots_are_allowed_for_read_only_lookup() {
+    let directory = secure_temp_dir();
+    let user_config = directory.path().join("missing-config");
+    let user_data = directory.path().join("missing-data");
+    let output = global_command(directory.path(), &user_config, &user_data)
+        .env(
+            "NEOENV_GLOBAL_CONFIG_DIR",
+            directory.path().join("system-config"),
+        )
+        .env(
+            "NEOENV_GLOBAL_INSTALL_DIR",
+            directory.path().join("system-install"),
+        )
+        .args(["--format", "json", "tool", "which", "--user", "go"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_ne!(document["diagnostic"]["code"], "NEO522", "{document}");
+    assert!(document.to_string().contains("go"), "{document}");
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_user_roots_may_be_symlinks_to_directories() {
+    let directory = secure_temp_dir();
+    let config_target = directory.path().join("config-target");
+    let data_target = directory.path().join("data-target");
+    let config_link = directory.path().join("config-link");
+    let data_link = directory.path().join("data-link");
+    fs::create_dir(&config_target).unwrap();
+    fs::create_dir(&data_target).unwrap();
+    std::os::unix::fs::symlink(&config_target, &config_link).unwrap();
+    std::os::unix::fs::symlink(&data_target, &data_link).unwrap();
+    let output = global_command(directory.path(), &config_link, &data_link)
+        .env(
+            "NEOENV_GLOBAL_CONFIG_DIR",
+            directory.path().join("system-config"),
+        )
+        .env(
+            "NEOENV_GLOBAL_INSTALL_DIR",
+            directory.path().join("system-install"),
+        )
+        .args(["--format", "json", "tool", "which", "--user", "go"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_ne!(document["diagnostic"]["code"], "NEO522", "{document}");
 }
 
 #[test]

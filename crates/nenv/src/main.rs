@@ -106,7 +106,7 @@ use neoenv_runtime::remote::{
 };
 use neoenv_runtime::{
     budget::{ResourceBudget, read_text_file},
-    paths::{UserDirectory, neoenv_directory, system_directory},
+    paths::{UserDirectory, system_directory},
     resolved_config::load_project_or_workspace_alias_with_profile,
     state_file::{self, LockedStateFile, StateFileError},
     tasks::{TaskEnvironment, TaskRunOptions, TaskRunnerDirectories},
