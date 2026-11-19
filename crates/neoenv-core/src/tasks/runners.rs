@@ -64,7 +64,7 @@ pub fn is_wsl_runner(name: &str) -> bool {
 pub fn is_builtin_runner(name: &str) -> bool {
     matches!(
         name,
-        "portable" | "argv" | "shell" | "render" | "ssh" | "composite"
+        "portable" | "argv" | "shell" | "render" | "ssh" | "composite" | "docker"
     ) || is_script_runner(name)
         || is_template_runner(name)
         || is_wsl_runner(name)

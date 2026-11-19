@@ -1910,6 +1910,17 @@ fn execute_task(
             },
         )
         .map_err(|error| error.to_string())?;
+        // A nested job must not discard a Docker recovery identity when it
+        // collapses its child report into a single outcome.
+        let recovery_messages: Vec<_> = report
+            .tasks
+            .iter()
+            .filter_map(|task| task.message.as_deref())
+            .filter(|message| message.contains("daemon outcome/cleanup unknown"))
+            .collect();
+        if !recovery_messages.is_empty() {
+            return Err(recovery_messages.join("; "));
+        }
         let outcome = if !options.cancellation.is_cancelled() && cancellation.timed_out() {
             TaskOutcome::TimedOut
         } else {
@@ -2152,6 +2163,21 @@ fn execute_task(
                 )
             } else {
                 execute_argv("sh", &arguments, &execution).map_err(format_process_error)
+            }
+        }
+        Some("docker") => {
+            if owned_background {
+                Err("docker tasks do not support owned background execution".to_owned())
+            } else {
+                super::docker::execute(
+                    required_run(action)?,
+                    action,
+                    &cwd,
+                    &task_environment,
+                    passthrough,
+                    options,
+                    timeout,
+                )
             }
         }
         Some("wsl") => super::runners::execute_wsl(

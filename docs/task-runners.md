@@ -12,6 +12,7 @@ A task's `uses:` can name a built-in runner instead of describing a command for
 | Go | `go` |
 | .NET | `dotnet` |
 | Windows bridge | `wsl` |
+| Container | `docker` |
 | Nushell | `nu` |
 | Local templates | `tmpl` (and the reference's `tmpl://...` spelling) |
 
@@ -44,6 +45,70 @@ Only `uses: shell` plus `run:` is currently supported in each step. Task
 references, nested composites, and path-bearing or otherwise unknown step
 fields are rejected. On the composite task itself, `cwd`, `env`, `dotenv`, and
 action arguments are rejected rather than ignored.
+## Docker tasks
+
+`run` names an image already available to the daemon; `args` are its command
+and arguments, passed literally, not through a host shell. For example, a
+package document `tasks/check.yaml` can contain:
+
+```yaml
+tasks:
+  check:
+    uses: docker
+    run: alpine:3.21
+    args: [echo, hello]
+    with:
+      timeout: 30s
+```
+
+Import and invoke it from a project:
+
+```yaml
+task_packages:
+  container-check:
+    from: ./tasks/check.yaml
+    task: check
+tasks:
+  check:
+    uses: package:container-check
+```
+
+The normal package trust and capability rules apply, including the package
+execute grant for external packages; see [execution trust](execution-trust.md).
+
+The runner invokes the `docker` CLI from the task environment's PATH, and relies
+on the selected CLI, its configuration, and its daemon remaining trusted and
+stable for the entire run and recovery. It creates a randomly named container
+with an ownership label, starts it attached, validates its label by immutable
+container ID, and force-removes it. It does not mount the project, forward the
+task environment into the container, pull images, supply Docker options, or
+support background tasks. The CLI itself receives the task environment. Docker
+is not a security sandbox: daemon configuration, image behavior, networking,
+and host privileges remain under the Docker operator's control.
+
+The task deadline defaults to one hour. After a confirmed create, ownership
+checks and removal each get at most ten seconds even if the task is cancelled.
+If create does not return a valid ID, or ownership or cleanup cannot be
+confirmed, the task fails with **daemon outcome/cleanup unknown** and a name
+and label value. A daemon may complete create after the client is interrupted;
+absence in an immediate inspection is not proof of cleanup. Inspect the same
+daemon later and remove only a container whose label matches the reported
+value. An unconfirmed outcome may require continued operator attention; the
+runner does not provide a durable recovery service. If the neoenv process
+itself is killed or the machine fails, no cleanup or diagnostic is guaranteed.
+
+The opt-in live lifecycle check requires the Docker CLI on `PATH`, a daemon at
+`unix:///var/run/docker.sock`, and an already-present `alpine:3.21` image. It
+uses an isolated empty Docker configuration and fails rather than skipping if a
+prerequisite is missing:
+
+```sh
+cargo test -p neoenv-runtime tasks::docker::tests::docker_live_daemon -- --ignored --exact
+```
+
+It creates only a uniquely labeled test container and checks for that identity
+after the runner's cleanup. The test does not prune or remove unrelated Docker
+resources. An unknown-outcome failure prints the identity for manual recovery.
 
 ## Inline versus file
 

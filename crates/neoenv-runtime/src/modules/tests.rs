@@ -115,6 +115,33 @@ fn direct_file_rejects_path_bearing_declarations_for_modules_and_packages() {
 }
 
 #[test]
+fn docker_task_can_be_loaded_from_a_package_document() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("neoenv.yaml");
+    fs::write(&root, "format_version: 1\n").unwrap();
+    fs::write(
+        temp.path().join("docker.yaml"),
+        "tasks:\n  check:\n    uses: docker\n    run: alpine:3.21\n    args: [echo, hello]\n",
+    )
+    .unwrap();
+    let mut loader =
+        ModuleLoader::with_profile(temp.path(), neoenv_config::ConfigProfile::Native).unwrap();
+    let loaded = loader
+        .load_task_package_with_identity(
+            &root,
+            &TaskPackage {
+                from: "docker.yaml".into(),
+                task: "check".into(),
+            },
+        )
+        .unwrap();
+    let action = loaded.project.tasks["check"].action.as_ref().unwrap();
+    assert_eq!(action.uses.as_deref(), Some("docker"));
+    assert_eq!(action.run.as_deref(), Some("alpine:3.21"));
+    assert_eq!(action.args, ["echo", "hello"]);
+}
+
+#[test]
 fn loads_nested_modules_before_importers_and_preserves_paths() {
     let temp = TempDir::new().unwrap();
     fs::create_dir(temp.path().join("modules")).unwrap();

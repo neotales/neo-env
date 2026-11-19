@@ -2001,6 +2001,116 @@ fn project_local_packages_keep_the_caller_subject_for_caller_declared_capabiliti
     assert!(allowed.status.success(), "{allowed:?}");
 }
 
+/// Exercises package resolution, trust, authorization, scheduler, and the
+/// Docker process boundary together, not just a manually tagged task.
+#[cfg(unix)]
+#[test]
+fn imported_docker_package_enforces_exact_grant_and_reports_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = project.path().join("neoenv.yaml");
+    fs::write(
+        &root,
+        "task_packages:\n  demo: demo\ntasks:\n  check:\n    uses: package:demo\n",
+    )
+    .unwrap();
+    let package = data.path().join("neoenv/tasks/demo.yaml");
+    fs::create_dir_all(package.parent().unwrap()).unwrap();
+    fs::write(
+        &package,
+        "tasks:\n  default:\n    uses: docker\n    run: example:1\n    args: [echo, hello]\n",
+    )
+    .unwrap();
+    let digest = format!("{:x}", Sha256::digest(fs::read(&package).unwrap()));
+    let policy = config.path().join("neoenv/capabilities.toml");
+    fs::create_dir_all(policy.parent().unwrap()).unwrap();
+    fs::write(
+        &policy,
+        "[[grants]]\nsubject = 'package:wrong'\ncapability = 'execute'\n",
+    )
+    .unwrap();
+    let docker = bin.path().join("docker");
+    fs::write(
+        &docker,
+        r#"#!/usr/bin/python3
+import os, sys
+from pathlib import Path
+p = Path(os.environ["FAKE_DOCKER_STATE"])
+a = sys.argv[1:]
+with (p / "calls").open("a") as f:
+    f.write(a[0] + "\n")
+if a[0] == "create":
+    (p / "name").write_text(a[a.index("--name") + 1])
+    (p / "marker").write_text(a[a.index("--label") + 1].split("=", 1)[1])
+    if os.environ.get("FAKE_DOCKER_FAIL") == "1":
+        sys.exit(1)
+    print("a" * 64)
+elif a[0] == "inspect":
+    print((p / "marker").read_text())
+elif a[0] == "start":
+    print("docker task output")
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |fail: bool, json: bool| {
+        let mut cmd = command();
+        cmd.current_dir(project.path())
+            .env("NEOENV_DATA_HOME", data.path())
+            .env("NEOENV_CONFIG_HOME", config.path())
+            .env("PATH", bin.path())
+            .env("FAKE_DOCKER_STATE", state.path())
+            .env("FAKE_DOCKER_FAIL", if fail { "1" } else { "0" })
+            .args(["task", "run", "check"])
+            .arg(&root);
+        if json {
+            cmd.args(["--format", "json"]);
+        }
+        cmd.output().unwrap()
+    };
+    let denied = run(false, false);
+    assert_eq!(denied.status.code(), Some(5), "{denied:?}");
+    assert!(!state.path().join("calls").exists());
+    fs::write(
+        &policy,
+        format!("[[grants]]\nsubject = 'package:{digest}'\ncapability = 'execute'\n"),
+    )
+    .unwrap();
+    let allowed = run(false, false);
+    assert!(allowed.status.success(), "{allowed:?}");
+    assert!(String::from_utf8_lossy(&allowed.stdout).contains("docker task output"));
+    assert_eq!(
+        fs::read_to_string(state.path().join("calls")).unwrap(),
+        "create\ninspect\nstart\ninspect\nrm\n"
+    );
+    fs::remove_file(state.path().join("calls")).unwrap();
+    let json = run(false, true);
+    assert!(json.status.success(), "{json:?}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("complete stdout must be JSON");
+    assert_eq!(report["tasks"][0]["outcome"], "succeeded");
+    assert!(String::from_utf8_lossy(&json.stderr).contains("docker task output"));
+    fs::remove_file(state.path().join("calls")).unwrap();
+    let failed = run(true, false);
+    assert!(!failed.status.success(), "{failed:?}");
+    let message = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        message.contains("daemon outcome/cleanup unknown"),
+        "{message}"
+    );
+    assert!(message.contains(&fs::read_to_string(state.path().join("name")).unwrap()));
+    assert!(message.contains(&fs::read_to_string(state.path().join("marker")).unwrap()));
+    assert_eq!(
+        fs::read_to_string(state.path().join("calls")).unwrap(),
+        "create\n"
+    );
+}
+
 #[test]
 // Exercises grant, revoke, replacement, and dual-subject denial as one lifecycle.
 #[allow(clippy::too_many_lines)]

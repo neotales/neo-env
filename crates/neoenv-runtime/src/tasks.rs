@@ -30,6 +30,7 @@ use crate::{
     budget::{ResourceBudget, read_text_file},
     resolved_config::apply_task_dotenv,
 };
+mod docker;
 mod handoff;
 mod model;
 #[cfg(not(windows))]

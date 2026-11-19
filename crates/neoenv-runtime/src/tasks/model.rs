@@ -239,7 +239,8 @@ pub struct ManagedRuntime {
 /// Controls execution behavior for a task graph.
 #[derive(Clone, Copy)]
 pub struct TaskRunOptions<'a> {
-    /// Keep stdout available for a final JSON document.
+    /// Route SSH and attached Docker output to stderr, keeping stdout
+    /// available for a final JSON document.
     pub ssh_output_to_stderr: bool,
     /// Additional declared-secret values to scrub from remote console output.
     pub ssh_secret_values: &'a [&'a str],

@@ -573,6 +573,70 @@ fn global_fallback_runner_requires_an_exact_external_execute_grant() {
 }
 
 #[test]
+fn external_docker_package_requires_its_execute_grant() {
+    let project = tempfile::TempDir::new().unwrap();
+    let package = neoenv_core::tasks::TaskPackageIdentity {
+        path: "docker.yaml".into(),
+        sha256: "abc123".into(),
+        export: "run".into(),
+        root: project.path().to_owned(),
+        external: true,
+    };
+    let subject = package.policy_subject();
+    let tasks = indexmap! {
+        "docker-task".into() => TaskDefinition {
+            package: Some(package),
+            action: Some(TaskAction {
+                uses: Some("docker".into()),
+                run: Some("example:1".into()),
+                ..TaskAction::default()
+            }),
+            ..TaskDefinition::default()
+        },
+    };
+    let values = IndexMap::new();
+    let cancellation = TaskCancellation::new();
+    let run = |grants| {
+        run_tasks_with_cancellation(
+            &tasks,
+            "docker-task",
+            "default",
+            project.path(),
+            TaskEnvironment {
+                values: &values,
+                path_operations: &[],
+                overrides: None,
+            },
+            &[],
+            TaskRunOptions {
+                ssh_output_to_stderr: false,
+                ssh_secret_values: &[],
+                inventories: None,
+                dry_run: true,
+                cancellation: &cancellation,
+                capability_grants: grants,
+                capability_policy_source: None,
+                remote_tasks: None,
+                task_directories: TaskRunnerDirectories::default(),
+                managed_runtimes: &[],
+                input_values: None,
+                vaults: None,
+                owned_backend: None,
+            },
+        )
+    };
+    assert!(matches!(
+        run(None),
+        Err(super::TaskRunError::CapabilityDenied { .. })
+    ));
+    let grants = CapabilityGrants::from_toml(&format!(
+        "[[grants]]\nsubject = {subject:?}\ncapability = \"execute\"\n"
+    ))
+    .unwrap();
+    assert!(run(Some(&grants)).is_ok());
+}
+
+#[test]
 fn fallback_rejects_ambient_paths_and_local_directory_escapes() {
     let project = tempfile::TempDir::new().unwrap();
     let outside = tempfile::TempDir::new().unwrap();
