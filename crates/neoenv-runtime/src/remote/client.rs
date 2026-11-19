@@ -497,6 +497,7 @@ pub(super) fn git_fetch<T: GitTransport + ?Sized>(
                 .ok_or_else(|| RemoteError::Io("non-UTF-8 cache path".into()))?,
         ],
         cancellation,
+        "initialize module repository",
     )?;
     let reference = match &module.reference {
         RemoteReference::Commit(commit) => commit.clone(),
@@ -518,6 +519,7 @@ pub(super) fn git_fetch<T: GitTransport + ?Sized>(
         destination,
         &["checkout", "--detach", "--force", &resolved],
         cancellation,
+        "checkout fetched module",
     )?;
     Ok(resolved)
 }
@@ -970,10 +972,12 @@ pub(super) fn tag_metadata_for(module: &RemoteModule, commit: &str) -> String {
 pub(super) fn run_git(
     arguments: &[&str],
     cancellation: Option<&TaskCancellation>,
+    operation: &'static str,
 ) -> Result<(), RemoteError> {
     run_git_command(
         Command::new("git").args(git_options()).args(arguments),
         cancellation,
+        operation,
     )
 }
 
@@ -981,6 +985,7 @@ pub(super) fn run_git_in(
     path: &Path,
     arguments: &[&str],
     cancellation: Option<&TaskCancellation>,
+    operation: &'static str,
 ) -> Result<(), RemoteError> {
     run_git_command(
         Command::new("git")
@@ -989,6 +994,7 @@ pub(super) fn run_git_in(
             .arg(path)
             .args(arguments),
         cancellation,
+        operation,
     )
 }
 
@@ -1005,6 +1011,7 @@ pub(super) fn run_git_in_with_transport(
             .arg(path)
             .args(arguments),
         cancellation,
+        "fetch module",
     )
 }
 
@@ -1020,12 +1027,13 @@ pub(super) fn git_failure(operation: &str, status: ExitStatus, stderr: &[u8]) ->
 pub(super) fn run_git_command(
     command: &mut Command,
     cancellation: Option<&TaskCancellation>,
+    operation: &'static str,
 ) -> Result<(), RemoteError> {
     let output = run_git_output(command, cancellation)?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(git_failure("fetch", output.status, &output.stderr))
+        Err(git_failure(operation, output.status, &output.stderr))
     }
 }
 

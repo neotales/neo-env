@@ -25,8 +25,15 @@ pub enum RemoteReference {
 /// The status and captured stderr are part of the typed source chain.  The
 /// display implementation intentionally contains only the operation and exit
 /// code because Git diagnostics can echo credential-bearing URLs or tokens.
+///
+/// `operation` is a human-readable diagnostic, not a stable programmatic
+/// identifier. Initialization, transport fetch, revision resolution, checkout,
+/// and tree reading can have different labels; callers must not match on them.
+/// Earlier versions labelled initialization and checkout failures as `fetch`;
+/// this also changes the corresponding rendered [`RemoteError`] text.
 #[derive(Debug)]
 pub struct GitFailure {
+    /// Human-readable, non-stable description of the failed operation.
     pub operation: String,
     pub status: ExitStatus,
     pub stderr: String,

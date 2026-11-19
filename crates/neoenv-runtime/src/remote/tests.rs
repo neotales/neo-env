@@ -88,6 +88,134 @@ fn git_failure_retains_status_but_never_renders_stderr() {
 }
 
 #[test]
+fn git_fetch_reports_the_failing_stage_without_exposing_paths() {
+    let directory = TempDir::new().unwrap();
+    let module =
+        RemoteModule::parse("github:octo/repo@0123456789abcdef0123456789abcdef01234567").unwrap();
+    let missing = directory.path().join("missing-origin");
+    let transport = LocalGitTransport {
+        repository: module.repository.clone(),
+        url: missing.display().to_string(),
+    };
+
+    let occupied = directory.path().join("occupied");
+    fs::write(&occupied, b"not a directory").unwrap();
+    let init_error = super::git_fetch(&module, &occupied, None, &transport).unwrap_err();
+    assert_eq!(
+        init_error.git_failure().unwrap().operation,
+        "initialize module repository"
+    );
+    assert!(
+        !init_error
+            .to_string()
+            .contains(&occupied.display().to_string())
+    );
+
+    let fetch_error = super::git_fetch(
+        &module,
+        &directory.path().join("checkout"),
+        None,
+        &transport,
+    )
+    .unwrap_err();
+    assert_eq!(fetch_error.git_failure().unwrap().operation, "fetch module");
+    assert!(
+        !fetch_error
+            .to_string()
+            .contains(&missing.display().to_string())
+    );
+}
+
+#[test]
+fn git_fetch_reports_checkout_failure_after_fetch_and_resolution() {
+    // The transport seam runs after init. An index lock blocks checkout, but
+    // does not block fetch or resolving FETCH_HEAD.
+    struct LockedCheckout {
+        origin: PathBuf,
+        destination: PathBuf,
+    }
+    impl super::GitTransport for LockedCheckout {
+        fn fetch_url(&self, _: &RemoteModule) -> String {
+            fs::write(self.destination.join(".git/index.lock"), b"locked").unwrap();
+            self.origin.to_str().unwrap().to_owned()
+        }
+
+        fn file_protocol(&self) -> super::GitFileProtocol {
+            super::GitFileProtocol::Allow
+        }
+    }
+
+    let directory = TempDir::new().unwrap();
+    let origin = directory.path().join("origin");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&origin)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(origin.join("module.yaml"), "env: {}\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["add", "module.yaml"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "commit",
+                "-qm",
+                "module"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let commit = super::revision(&origin).unwrap();
+    let module = RemoteModule::parse(&format!("github:octo/repo@{commit}")).unwrap();
+    let destination = directory.path().join("destination");
+    let transport = LockedCheckout {
+        origin,
+        destination: destination.clone(),
+    };
+    let checkout_error = super::git_fetch(&module, &destination, None, &transport).unwrap_err();
+    assert_eq!(
+        checkout_error.git_failure().unwrap().operation,
+        "checkout fetched module"
+    );
+    assert_eq!(
+        super::revision_ref(&destination, "FETCH_HEAD^{commit}", None).unwrap(),
+        commit
+    );
+    assert!(destination.join(".git/index.lock").is_file());
+    assert!(
+        !checkout_error
+            .to_string()
+            .contains(&destination.display().to_string())
+    );
+    fs::remove_file(destination.join(".git/index.lock")).unwrap();
+    super::run_git_in(
+        &destination,
+        &["checkout", "--detach", "--force", &commit],
+        None,
+        "checkout fetched module",
+    )
+    .unwrap();
+    assert!(destination.join("module.yaml").is_file());
+}
+
+#[test]
 fn local_git_subpaths_reject_query_fragment_and_backslash() {
     let root = TempDir::new().unwrap();
     let path = root.path().canonicalize().unwrap();

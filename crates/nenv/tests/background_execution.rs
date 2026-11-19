@@ -466,14 +466,17 @@ tasks:
 #[test]
 #[cfg(target_os = "linux")]
 fn foreground_timeout_stops_descendant_holding_pipeline_open() {
+    // The job deadline includes supervisor authentication before the shell
+    // starts. Leave startup headroom and separately require the ready marker;
+    // the escaped marker remains scheduled beyond the deadline.
     let root = project(
         r#"
 jobs:
   build:
-    timeout: 2s
+    timeout: 15s
     steps:
       - uses: shell
-        run: "sh -c '(touch descendant-ready; sleep 4; touch escaped) & exit 0' | cat"
+        run: "sh -c '(touch descendant-ready; sleep 20; touch escaped) & exit 0' | cat"
 "#,
     );
     let output = run(&root, &["job", "run", "build"]);
@@ -487,7 +490,7 @@ jobs:
         stdout.contains("build:1 TimedOut") || stdout.contains("build TimedOut"),
         "{stdout}"
     );
-    std::thread::sleep(std::time::Duration::from_millis(4300));
+    std::thread::sleep(std::time::Duration::from_millis(20300));
     assert!(!root.path().join("escaped").exists());
 }
 

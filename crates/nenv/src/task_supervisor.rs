@@ -688,6 +688,9 @@ impl Drop for OwnedChild {
 mod tests {
     use super::*;
 
+    // The runtime background_tasks harness includes this module without
+    // registering its #[test] functions, leaving this helper unused there.
+    #[allow(dead_code)]
     fn bounded_status(command: &mut Command, timeout: Duration) -> Option<ExitStatus> {
         command
             .stdin(Stdio::null())
