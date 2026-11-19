@@ -77,7 +77,7 @@ fn child_ensure_same_os_entry() {
 fn two_processes_see_one_os_ensure_result() {
     let temp = tempfile::TempDir::new().unwrap();
     let store = temp.path().join("os-store");
-    let lock_root = temp.path().join("locks");
+    let lock_root = temp.path().canonicalize().unwrap().join("locks");
     // Touch nothing at the store path; the first child creates it.
 
     let executable = std::env::current_exe().expect("test executable");

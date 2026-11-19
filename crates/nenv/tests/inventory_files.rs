@@ -1,10 +1,22 @@
-//! Real CLI inventory composition and strict file boundaries; no network.
-use std::{fs, path::Path, process::Output};
+//! Real CLI inventory composition and strict file boundaries; loopback only.
+use std::{
+    fs,
+    net::TcpListener,
+    path::Path,
+    process::{Child, Output},
+    thread,
+    time::{Duration, Instant},
+};
 
 mod support;
 
 fn run(root: &Path, args: &[&str]) -> Output {
-    support::TestCommand::new()
+    command(root, args).output().expect("CLI")
+}
+
+fn command(root: &Path, args: &[&str]) -> support::TestCommand {
+    let mut command = support::TestCommand::new();
+    command
         .args(args)
         .current_dir(root)
         .env_clear()
@@ -12,9 +24,8 @@ fn run(root: &Path, args: &[&str]) -> Output {
         .env("NEOENV_CONFIG_HOME", root.join("config"))
         .env("NEOENV_DATA_HOME", root.join("data"))
         .env("NEOENV_CACHE_HOME", root.join("cache"))
-        .env("NEOENV_STATE_HOME", root.join("state"))
-        .output()
-        .expect("CLI")
+        .env("NEOENV_STATE_HOME", root.join("state"));
+    command
 }
 
 fn inventory(host: &str) -> String {
@@ -131,7 +142,7 @@ fn validate_refuses_ssh_fields_the_runner_cannot_honor() {
             "    with: {inventory: lab, targets: first}\n"
         };
         let document = format!("tasks:\n  sample:\n    uses: ssh\n    run: 'true'\n{with}{field}");
-        fs::write(root.join("neoenv.yaml"), document).unwrap();
+        fs::write(root.join("neoenv.yaml"), &document).unwrap();
         assert!(
             !run(root, &["validate"]).status.success(),
             "unused SSH field was accepted"
@@ -169,6 +180,7 @@ fn inventory_symlink_escape_and_local_scp_link_are_refused_without_network() {
 
 #[test]
 fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumers() {
+    let local_run = portable_command(env!("CARGO_BIN_EXE_nenv"), &["--version"]);
     for source in [
         "user-malformed",
         "user-unsupported",
@@ -177,9 +189,18 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
     ] {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let mut document = String::from(
-            "tasks:\n  local:\n    uses: portable\n    run: 'echo local-only'\n  remote:\n    uses: ssh\n    with: {inventory: lab, targets: first}\n    run: 'true'\n  wrapper:\n    deps: [remote]\n    uses: portable\n    run: 'echo unreachable'\n",
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inline = format!(
+            "inventories:\n  lab:\n    defaults: {{user: fixture, port: {port}}}\n    hosts:\n      first:\n        address: 127.0.0.1\n        host_key: {}\n",
+            "AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea"
         );
+        let mut document = format!(
+            "{inline}tasks:\n  local:\n    uses: portable\n    run: {local_run}\n  remote:\n    uses: ssh\n    with: {{inventory: lab, targets: first}}\n    run: {local_run}\n  wrapper:\n    deps: [remote]\n    uses: portable\n    run: {local_run}\n"
+        );
+        let policy = root.join("config/neoenv");
+        fs::create_dir_all(&policy).unwrap();
         match source {
             "user-malformed" | "user-unsupported" => {
                 let auto = root.join("config/neoenv/inventories");
@@ -198,7 +219,31 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
                 }
             }
         }
-        fs::write(root.join("neoenv.yaml"), document).unwrap();
+        fs::write(root.join("neoenv.yaml"), &document).unwrap();
+        let project = neoenv_config::parse_project(
+            &root.join("neoenv.yaml"),
+            &fs::read_to_string(root.join("neoenv.yaml")).unwrap(),
+        )
+        .unwrap();
+        let endpoint = neoenv_runtime::ssh::endpoint_subject_with_context(
+            &project.inventories["lab"],
+            "first",
+            &std::collections::BTreeMap::new(),
+            root,
+        )
+        .unwrap();
+        let remote_subject = format!("project:{}/task:remote", root.display());
+        let wrapper_subject = format!("project:{}/task:wrapper", root.display());
+        fs::write(
+            policy.join("capabilities.toml"),
+            format!(
+                "[[grants]]\nsubject = \"inventory:lab/host:first\"\ncapability = \"connect\"\n\
+                 [[grants]]\nsubject = {endpoint:?}\ncapability = \"connect\"\n\
+                 [[grants]]\nsubject = {remote_subject:?}\ncapability = \"execute\"\n\
+                 [[grants]]\nsubject = {wrapper_subject:?}\ncapability = \"execute\"\n"
+            ),
+        )
+        .unwrap();
         for args in [
             vec!["validate"],
             vec!["inspect"],
@@ -213,7 +258,11 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
                 String::from_utf8_lossy(&output.stderr)
             );
             if args[0] == "run" {
-                assert!(String::from_utf8_lossy(&output.stdout).contains("local-only"));
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("nenv "),
+                    "{source} {args:?} did not execute the fixture binary: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
             }
         }
         for args in [
@@ -228,6 +277,12 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
                 !output.status.success(),
                 "{source} {args:?} accepted invalid inventory"
             );
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains("nenv "),
+                "{source} {args:?} reached the task action: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_no_connection(&listener, source, &args);
             let message = String::from_utf8_lossy(&output.stderr);
             assert!(
                 message.contains("inventory"),
@@ -238,5 +293,91 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
                 "inventory was not validated before authorization"
             );
         }
+        if source == "user-malformed" || source == "user-unsupported" {
+            fs::remove_dir_all(root.join("config/neoenv/inventories")).unwrap();
+        } else {
+            fs::remove_file(root.join("bad.yaml")).ok();
+            document = document.replace("inventory_files: [bad.yaml]\n", "");
+            fs::write(root.join("neoenv.yaml"), document).unwrap();
+        }
+        let mut child = command(root, &["run", "remote"])
+            .spawn()
+            .expect("start positive SSH control");
+        assert_connection(&listener, source, &mut child);
     }
+}
+
+fn assert_no_connection(listener: &TcpListener, source: &str, args: &[&str]) {
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) => panic!("{source} {args:?}: listener failed: {error}"),
+        Ok((stream, _)) => {
+            drop(stream);
+            panic!("{source} {args:?} attempted an SSH connection");
+        }
+    }
+}
+
+fn assert_connection(listener: &TcpListener, source: &str, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                drop(stream);
+                while Instant::now() < deadline {
+                    if child.try_wait().expect("check SSH control child").is_some() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                terminate_child(child);
+                panic!("{source}: positive SSH control did not exit after listener close");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                terminate_child(child);
+                panic!("{source}: listener failed: {error}");
+            }
+        }
+        if Instant::now() >= deadline {
+            terminate_child(child);
+            panic!("{source}: positive SSH control did not reach the listener before deadline");
+        }
+        if child.try_wait().expect("check SSH control child").is_some() {
+            panic!("{source}: SSH control exited before connecting");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Serializes a portable command for YAML without relying on a shell or PATH lookup.
+fn portable_command(program: &str, args: &[&str]) -> String {
+    let command = std::iter::once(program)
+        .chain(args.iter().copied())
+        .map(|part| format!("{part:?}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    serde_yaml::to_string(&command)
+        .expect("command serializes")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn portable_command_yaml_preserves_spaces_and_backslashes() {
+    let program = r"C:\fixture path\nenv.exe";
+    let serialized = portable_command(program, &["--version"]);
+    let yaml = format!("run: {serialized}\n");
+    let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    let run = value["run"].as_str().unwrap();
+    let parsed = neotales_process::parse(run).unwrap();
+    assert_eq!(parsed.programs.len(), 1);
+    assert_eq!(parsed.programs[0].commands.len(), 1);
+    assert_eq!(parsed.programs[0].commands[0].program, program);
+    assert_eq!(parsed.programs[0].commands[0].arguments, ["--version"]);
 }

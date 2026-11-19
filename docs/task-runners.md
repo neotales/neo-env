@@ -97,14 +97,25 @@ value. An unconfirmed outcome may require continued operator attention; the
 runner does not provide a durable recovery service. If the neoenv process
 itself is killed or the machine fails, no cleanup or diagnostic is guaranteed.
 
-The opt-in live lifecycle check requires the Docker CLI on `PATH`, a daemon at
-`unix:///var/run/docker.sock`, and an already-present `alpine:3.21` image. It
-uses an isolated empty Docker configuration and fails rather than skipping if a
-prerequisite is missing:
+The opt-in live lifecycle check requires the Docker CLI on `PATH`, the
+`NEOENV_TEST_DOCKER_HOST` environment variable naming an explicitly dedicated
+local Unix-socket Docker daemon, and an already-present `alpine:3.21` image. It
+does not fall back to the Docker CLI's configured/default daemon and rejects
+network transports (including TCP, which would otherwise need deliberate TLS
+configuration outside this test's scope) and the standard `/var/run/docker.sock`
+and `/run/docker.sock` endpoints. Configure the dedicated local socket
+explicitly before selecting the test; the guard blocks known default socket
+paths including lexical aliases, but cannot prove that any other endpoint is
+isolated. The operator must verify that the configured daemon is dedicated to
+this test. For example:
 
 ```sh
+export NEOENV_TEST_DOCKER_HOST=unix:///tmp/neoenv-test-docker
 cargo test -p neoenv-runtime tasks::docker::tests::docker_live_daemon -- --ignored --exact
 ```
+
+It uses an isolated empty Docker configuration and fails rather than skipping
+if a prerequisite is missing.
 
 It creates only a uniquely labeled test container and checks for that identity
 after the runner's cleanup. The test does not prune or remove unrelated Docker

@@ -1014,7 +1014,7 @@ fn keepass_vault(directory: &TempDir, database: &Path) -> VaultSet {
         &directory.path().join("neoenv.yaml"),
     );
     VaultSet::from_declarations(IndexMap::from([declaration]))
-        .with_lock_root(directory.path().join("locks"))
+        .with_lock_root(directory.path().canonicalize().unwrap().join("locks"))
 }
 
 #[test]
@@ -1153,12 +1153,20 @@ fn a_failed_keepass_publish_leaves_the_original_database_unchanged() {
         &directory.path().join("neoenv.yaml"),
     );
     let vaults = VaultSet::from_declarations(IndexMap::from([declaration]))
-        .with_lock_root(directory.path().join("locks"));
+        .with_lock_root(directory.path().canonicalize().unwrap().join("locks"));
 
     fs::set_permissions(&database_dir, fs::Permissions::from_mode(0o555)).unwrap();
     let result = vaults.get("nsv://work/work/new?ensure=true&size=8", &BTreeMap::new());
     fs::set_permissions(&database_dir, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert!(result.is_err(), "a read-only database directory must fail");
+    let error = result.expect_err("a read-only database directory must fail");
+    assert_eq!(error.code(), "NEO706");
+    assert!(
+        error
+            .message()
+            .contains("could not prepare the KeePass database update"),
+        "{}",
+        error.message()
+    );
     assert_eq!(fs::read(&database).unwrap(), before);
 }

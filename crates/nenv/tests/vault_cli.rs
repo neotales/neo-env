@@ -17,7 +17,8 @@ use neotales_age::{AgeFile, AgeKey, AgeRecipient};
 use tempfile::TempDir;
 
 struct Fixture {
-    directory: TempDir,
+    _directory: TempDir,
+    canonical_path: PathBuf,
     config: PathBuf,
     identity: PathBuf,
     recipient: String,
@@ -25,13 +26,23 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let directory = TempDir::new().unwrap();
+        Self::from_directory(TempDir::new().unwrap())
+    }
+
+    fn from_directory(directory: TempDir) -> Self {
+        // The vault lock deliberately rejects symlink ancestors. TempDir may
+        // retain a symlinked system temp path (for example on macOS).
+        #[cfg(unix)]
+        let canonical_path = directory.path().canonicalize().unwrap();
+        #[cfg(not(unix))]
+        let canonical_path = directory.path().to_owned();
         let key = AgeKey::generate().unwrap();
-        let identity = directory.path().join("identity.txt");
+        let identity = canonical_path.join("identity.txt");
         fs::write(&identity, format!("{}\n", key.private_key)).unwrap();
-        let config = directory.path().join("neoenv.yaml");
+        let config = canonical_path.join("neoenv.yaml");
         Self {
-            directory,
+            _directory: directory,
+            canonical_path,
             config,
             identity,
             recipient: key.public_key,
@@ -44,7 +55,7 @@ impl Fixture {
     }
 
     fn path(&self) -> &Path {
-        self.directory.path()
+        &self.canonical_path
     }
 
     fn write_config(&self, body: &str) {
@@ -896,7 +907,22 @@ fn write_kdbx(path: &std::path::Path) {
 
 #[test]
 fn secret_set_updates_keepass_and_preserves_exact_stdin_bytes() {
-    let fixture = Fixture::new();
+    check_secret_set_updates_keepass(&Fixture::new());
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_set_works_when_fixture_temp_parent_is_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let parent = TempDir::new().unwrap();
+    let link = parent.path().join("temp-link");
+    symlink(parent.path().canonicalize().unwrap(), &link).unwrap();
+    let fixture = Fixture::from_directory(TempDir::new_in(&link).unwrap());
+    check_secret_set_updates_keepass(&fixture);
+}
+
+fn check_secret_set_updates_keepass(fixture: &Fixture) {
     let database = fixture.path().join("secrets.kdbx");
     write_kdbx(&database);
     let config = format!(

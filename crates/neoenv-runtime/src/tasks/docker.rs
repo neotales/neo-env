@@ -214,6 +214,79 @@ mod tests {
     use crate::tasks::{TaskCancellation, TaskRunnerDirectories};
     use std::{fs, os::unix::fs::PermissionsExt};
 
+    fn normalize_socket_path(path: &Path) -> std::path::PathBuf {
+        let mut normalized = std::path::PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if normalized != Path::new("/") {
+                        normalized.pop();
+                    }
+                }
+                _ => normalized.push(component.as_os_str()),
+            }
+        }
+        normalized
+    }
+
+    fn dedicated_docker_host(value: Option<&str>) -> Result<String, &'static str> {
+        let host = value.ok_or("NEOENV_TEST_DOCKER_HOST must name a dedicated Docker daemon")?;
+        let path = host.strip_prefix("unix://");
+        if host.trim().is_empty() {
+            return Err("NEOENV_TEST_DOCKER_HOST must not target a shared default socket");
+        }
+        if let Some(path) = path {
+            let path = Path::new(path);
+            if !path.is_absolute() {
+                return Err("NEOENV_TEST_DOCKER_HOST must name an absolute local Unix socket");
+            }
+            let normalized = normalize_socket_path(path);
+            let canonical = path.canonicalize().unwrap_or(normalized);
+            if ["/var/run/docker.sock", "/run/docker.sock"]
+                .iter()
+                .any(|shared| canonical == Path::new(shared))
+            {
+                return Err("NEOENV_TEST_DOCKER_HOST must not target a shared default socket");
+            }
+            if !canonical.is_absolute() || canonical == Path::new("/") {
+                return Err("NEOENV_TEST_DOCKER_HOST must name an absolute local Unix socket");
+            }
+        } else {
+            return Err("NEOENV_TEST_DOCKER_HOST must be a local Unix socket");
+        }
+        Ok(host.to_owned())
+    }
+
+    #[test]
+    fn live_socket_requires_explicit_dedicated_endpoint() {
+        assert!(dedicated_docker_host(None).is_err());
+        assert!(dedicated_docker_host(Some("")).is_err());
+        assert!(dedicated_docker_host(Some("unix://")).is_err());
+        assert!(dedicated_docker_host(Some("unix://relative/socket")).is_err());
+        assert!(dedicated_docker_host(Some("unix://.")).is_err());
+        assert!(dedicated_docker_host(Some("unix:///..")).is_err());
+        assert!(dedicated_docker_host(Some("unix:///var/run/docker.sock")).is_err());
+        assert!(dedicated_docker_host(Some("unix:///run/docker.sock")).is_err());
+        assert!(dedicated_docker_host(Some("unix:///run/./docker.sock")).is_err());
+        assert!(dedicated_docker_host(Some("unix:///var/run/../run/docker.sock")).is_err());
+        assert!(dedicated_docker_host(Some("unix:///../run/docker.sock")).is_err());
+        assert_eq!(
+            normalize_socket_path(Path::new("/../run/docker.sock")),
+            Path::new("/run/docker.sock")
+        );
+        assert!(dedicated_docker_host(Some("tcp://127.0.0.1:2376")).is_err());
+        assert!(dedicated_docker_host(Some("https://127.0.0.1:2376")).is_err());
+        let local_socket = format!(
+            "unix://{}",
+            Path::new("/tmp").join("neoenv-dedicated").display()
+        );
+        assert_eq!(
+            dedicated_docker_host(Some(&local_socket)).unwrap(),
+            local_socket
+        );
+    }
+
     // This fake separates the create reply from a late daemon-side effect.
     // It never invokes a real Docker daemon.
     const FAKE: &str = r#"#!/usr/bin/python3
@@ -373,8 +446,11 @@ elif op == "rm":
     /// Its wrapper records only the generated name and label; deletion remains
     /// exclusively the runner's marker-checked operation.
     #[test]
-    #[ignore = "requires local Docker daemon and preloaded alpine:3.21"]
+    #[ignore = "requires NEOENV_TEST_DOCKER_HOST for a dedicated daemon and preloaded alpine:3.21"]
     fn docker_live_daemon() {
+        let docker_host =
+            dedicated_docker_host(std::env::var("NEOENV_TEST_DOCKER_HOST").ok().as_deref())
+                .expect("live Docker test requires an explicit dedicated socket");
         let path = std::env::var_os("PATH").expect("PATH must locate the Docker CLI");
         let real = std::env::split_paths(&path)
             .map(|directory| directory.join("docker"))
@@ -396,7 +472,7 @@ elif op == "rm":
             ("REAL_DOCKER".into(), real.display().to_string()),
             ("LIVE_DIR".into(), dir.path().display().to_string()),
             ("DOCKER_CONFIG".into(), config.path().display().to_string()),
-            ("DOCKER_HOST".into(), "unix:///var/run/docker.sock".into()),
+            ("DOCKER_HOST".into(), docker_host),
         ]);
         let available = || {
             matches!(

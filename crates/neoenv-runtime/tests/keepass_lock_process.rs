@@ -64,7 +64,7 @@ fn child_ensure_same_keepass_entry() {
 fn two_processes_see_one_keepass_ensure_result() {
     let temp = TempDir::new().unwrap();
     let database = temp.path().join("secrets.kdbx");
-    let lock_root = temp.path().join("locks");
+    let lock_root = temp.path().canonicalize().unwrap().join("locks");
     build_database(&database);
 
     let executable = std::env::current_exe().expect("test executable");

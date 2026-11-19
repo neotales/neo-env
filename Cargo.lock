@@ -2262,6 +2262,7 @@ dependencies = [
  "neotales-age",
  "neotales-env",
  "neotales-keepass",
+ "neotales-process",
  "nix 0.31.4",
  "rcgen",
  "ring",

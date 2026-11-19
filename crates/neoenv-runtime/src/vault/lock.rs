@@ -39,13 +39,11 @@ pub(super) fn default_lock_root() -> Option<PathBuf> {
 
 /// Unit tests must not create lock files in the user's real state directory.
 #[cfg(test)]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "the test and production signatures differ only because tests always have a temp root"
-)]
 pub(super) fn default_lock_root() -> Option<PathBuf> {
     Some(
         std::env::temp_dir()
+            .canonicalize()
+            .ok()?
             .join("neoenv-vault-locks")
             .join(std::process::id().to_string()),
     )
@@ -278,7 +276,7 @@ mod tests {
     #[test]
     fn lock_files_are_hashed_and_named_by_resource_identity() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().join("locks");
+        let root = temp.path().canonicalize().unwrap().join("locks");
         with_mutation_lock(&root, b"service-secret\0account-secret", || Ok(())).expect("lock");
         let names: Vec<String> = fs::read_dir(&root)
             .unwrap()
@@ -303,7 +301,7 @@ mod tests {
     fn refuses_permissive_lock_root() {
         use std::os::unix::fs::PermissionsExt as _;
         let temp = TempDir::new().unwrap();
-        let root = temp.path().join("locks");
+        let root = temp.path().canonicalize().unwrap().join("locks");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(with_mutation_lock(&root, b"resource", || Ok(())).is_err());
@@ -314,7 +312,7 @@ mod tests {
     fn refuses_symlink_lock_file_without_opening_its_target() {
         use std::os::unix::fs::symlink;
         let temp = TempDir::new().unwrap();
-        let root = temp.path().join("locks");
+        let root = temp.path().canonicalize().unwrap().join("locks");
         fs::create_dir(&root).unwrap();
         let victim = temp.path().join("victim");
         fs::write(&victim, b"untouched").unwrap();
@@ -328,9 +326,10 @@ mod tests {
     fn refuses_a_symlink_in_the_lock_root_path() {
         use std::os::unix::fs::symlink;
         let temp = TempDir::new().unwrap();
-        let target = temp.path().join("target");
+        let parent = temp.path().canonicalize().unwrap();
+        let target = parent.join("target");
         fs::create_dir(&target).unwrap();
-        let link = temp.path().join("link");
+        let link = parent.join("link");
         symlink(&target, &link).unwrap();
         assert!(with_mutation_lock(&link.join("locks"), b"resource", || Ok(())).is_err());
         assert_eq!(fs::read_dir(target).unwrap().count(), 0);

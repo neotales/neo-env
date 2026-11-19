@@ -49,6 +49,7 @@ rustix = { version = "=1.1.6", features = ["process", "net"] }
 signal-hook = "=0.3.18"
 
 [dev-dependencies]
+neotales-process = { path = "../neotales-process", version = "0.0.0-alpha.1" }
 rcgen.workspace = true
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 base64.workspace = true
