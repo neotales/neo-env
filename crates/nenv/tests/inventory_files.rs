@@ -188,7 +188,12 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
         "declared-missing",
     ] {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        // Task capability subjects are built from the canonical project root,
+        // as the scheduler does. A raw temp path can differ once resolved
+        // (macOS `/var` -> `/private/var`, Windows 8.3 name -> long name), so a
+        // non-canonical fixture would grant execute to a subject the runner
+        // never asks about.
+        let root = directory.path().canonicalize().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -229,7 +234,7 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
             &project.inventories["lab"],
             "first",
             &std::collections::BTreeMap::new(),
-            root,
+            &root,
         )
         .unwrap();
         let remote_subject = format!("project:{}/task:remote", root.display());
@@ -251,7 +256,7 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
             vec!["task", "plan", "local"],
             vec!["run", "local"],
         ] {
-            let output = run(root, &args);
+            let output = run(&root, &args);
             assert!(
                 output.status.success(),
                 "{source} {args:?}: {}",
@@ -272,7 +277,7 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
             vec!["run", "remote"],
             vec!["run", "wrapper"],
         ] {
-            let output = run(root, &args);
+            let output = run(&root, &args);
             assert!(
                 !output.status.success(),
                 "{source} {args:?} accepted invalid inventory"
@@ -300,7 +305,7 @@ fn invalid_external_inventory_is_lazy_for_local_commands_but_strict_for_consumer
             document = document.replace("inventory_files: [bad.yaml]\n", "");
             fs::write(root.join("neoenv.yaml"), document).unwrap();
         }
-        let mut child = command(root, &["run", "remote"])
+        let mut child = command(&root, &["run", "remote"])
             .spawn()
             .expect("start positive SSH control");
         assert_connection(&listener, source, &mut child);
